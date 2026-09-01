@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#07111f">
+    <title>小声场 · 智能音箱 Demo</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="page-glow page-glow-one" aria-hidden="true"></div>
+    <div class="page-glow page-glow-two" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="小声场首页">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <span>
+          <strong>小声场</strong>
+          <small>Mac voice prototype</small>
+        </span>
+      </a>
+      <div class="mode-badge is-loading" id="modeBadge">
+        <span class="mode-dot"></span>
+        <span id="modeLabel">正在连接本地服务</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="voice-panel" aria-labelledby="voiceTitle">
+        <div class="eyebrow">VOICE ASSISTANT · V0.2</div>
+        <h1 id="voiceTitle">点一下开始，再点一下发送</h1>
+        <p class="lead">说完后再按一次；MacBook 麦克风负责倾听，扬声器负责回答。</p>
+
+        <div class="speaker-stage" id="speakerStage">
+          <div class="orbit orbit-one" aria-hidden="true"></div>
+          <div class="orbit orbit-two" aria-hidden="true"></div>
+          <div class="wave-ring" aria-hidden="true">
+            <i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+          </div>
+          <button class="mic-button" id="micButton" type="button" aria-label="开始录音">
+            <span class="mic-face">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 15.35a3.8 3.8 0 0 0 3.8-3.8V6.3a3.8 3.8 0 1 0-7.6 0v5.25a3.8 3.8 0 0 0 3.8 3.8Z"></path>
+                <path d="M5.9 11.3v.25a6.1 6.1 0 0 0 12.2 0v-.25M12 17.7v3.1M8.9 20.8h6.2"></path>
+              </svg>
+            </span>
+          </button>
+        </div>
+
+        <div class="voice-status" aria-live="polite">
+          <strong id="statusTitle">准备好了</strong>
+          <span id="statusDetail">点击中央按钮开始录音</span>
+          <time id="recordingTimer" hidden>00:00</time>
+        </div>
+
+        <div class="quick-actions">
+          <button class="soft-button" id="stopAudioButton" type="button" disabled>
+            停止朗读
+          </button>
+          <span class="limit-note">单次最长 30 秒</span>
+        </div>
+      </section>
+
+      <section class="conversation-panel" aria-labelledby="conversationTitle">
+        <div class="panel-heading">
+          <div>
+            <div class="eyebrow">LIVE TRANSCRIPT</div>
+            <h2 id="conversationTitle">本次对话</h2>
+          </div>
+          <button class="text-button" id="resetButton" type="button">清空</button>
+        </div>
+
+        <div class="messages" id="messages" aria-live="polite">
+          <article class="message assistant-message intro-message">
+            <div class="avatar">声</div>
+            <div>
+              <span class="message-role">助手</span>
+              <p>你好。我已经在这台 Mac 上待命，你可以先测试麦克风，也可以在下方直接打字。</p>
+            </div>
+          </article>
+        </div>
+
+        <form class="text-entry" id="textForm">
+          <label class="sr-only" for="textInput">输入问题</label>
+          <textarea id="textInput" rows="1" maxlength="4000" placeholder="也可以先打字测试…"></textarea>
+          <button id="sendButton" type="submit" aria-label="发送文字问题">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m4 12 15-7-5.3 14-2.6-5.5L4 12Z"></path>
+              <path d="m11.1 13.5 3.7-4"></path>
+            </svg>
+          </button>
+        </form>
+
+        <div class="privacy-card">
+          <div class="privacy-icon" aria-hidden="true">⌁</div>
+          <div>
+            <strong id="privacyTitle">本地演示保护已开启</strong>
+            <p id="privacyText">当前不会把录音发送到云端。配置 API Key 后，页面会在真实模式下明确提示。</p>
+          </div>
+        </div>
+
+        <p class="disclosure" id="voiceDisclosure">演示模式使用这台 Mac 的系统语音朗读示例回答。</p>
+      </section>
+    </main>
+
+    <section class="feature-deck" aria-label="音乐和长期记忆">
+      <article class="feature-card music-card" aria-labelledby="musicTitle">
+        <div class="feature-heading">
+          <div>
+            <div class="eyebrow">WHITELIST RADIO</div>
+            <h2 id="musicTitle">网络电台</h2>
+          </div>
+          <span class="feature-status" id="musicState">正在载入电台</span>
+        </div>
+
+        <label class="field-label" for="stationSelect">选择白名单电台</label>
+        <select id="stationSelect" disabled>
+          <option value="">正在载入…</option>
+        </select>
+
+        <div class="music-controls" aria-label="电台播放控制">
+          <button class="primary-control" id="musicPlayButton" type="button" disabled>播放</button>
+          <button class="soft-button" id="musicPauseButton" type="button" disabled>暂停</button>
+          <button class="soft-button" id="musicStopButton" type="button" disabled>停止</button>
+        </div>
+
+        <label class="volume-control" for="musicVolume">
+          <span>音量</span>
+          <input id="musicVolume" type="range" min="0" max="100" value="45" step="1" disabled>
+          <output id="musicVolumeValue" for="musicVolume">45%</output>
+        </label>
+        <p class="feature-note">模型只能选择这里列出的电台，不能把任意网址交给播放器。</p>
+      </article>
+
+      <article class="feature-card memory-card" aria-labelledby="memoryTitle">
+        <div class="feature-heading">
+          <div>
+            <div class="eyebrow">LOCAL MEMORY</div>
+            <h2 id="memoryTitle">长期记忆</h2>
+          </div>
+          <div class="heading-actions">
+            <button class="text-button" id="refreshMemoriesButton" type="button">刷新</button>
+            <button class="text-button danger-button" id="clearMemoriesButton" type="button" disabled>全部忘记</button>
+          </div>
+        </div>
+
+        <div class="memory-list" id="memoryList" aria-live="polite">
+          <p class="empty-state">正在读取本地记忆…</p>
+        </div>
+        <p class="feature-note memory-disclosure">
+          记忆保存在本机；回答相关问题时，选中的少量非敏感记忆可能随问题发送到当前云端模型。私密记忆仅留在本机，你可以随时查看和删除。
+        </p>
+      </article>
+    </section>
+
+    <footer>
+      <span>仅监听本机地址 127.0.0.1</span>
+      <span aria-hidden="true">·</span>
+      <span>录音不会写入磁盘</span>
+      <span aria-hidden="true">·</span>
+      <span>天气数据来自 Open-Meteo</span>
+    </footer>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,198 @@
+# 小声场：Mac 智能音箱软件 Demo
+
+这是一个直接使用 MacBook 麦克风和扬声器的本地语音助手原型：
+
+`麦克风录音 → SiliconFlow 免费语音识别 → 工具/本地记忆 → 免费大模型回答 → Mac 系统朗读`
+
+浏览器负责麦克风权限和声音播放，Python 本地服务负责安全地调用 API。项目不需要安装 Python 包、Homebrew、Node、FFmpeg 或 PortAudio，但这台 Mac 需要有 Python 3.9 或更高版本。启动器会先检查 `/usr/bin/python3`，再查找系统中其他可用的 `python3`。
+
+如果这是朋友发来的分享包，请先阅读同目录的 `START-HERE.txt`。也可以让 Codex 阅读 `CODEX_HELP.md` 后协助排查；任何情况下都不要把 API Key 粘贴到聊天、截图或代码中。
+
+## 使用说明
+
+### 快速开始
+
+1. 使用 macOS，并确认有 Python 3.9 或更高版本。
+2. 完整下载或解压项目目录，不要直接在压缩包预览中运行。
+3. 双击 `configure_api_key.command`，按提示输入自己的 SiliconFlow API Key。输入不会显示在屏幕上，Key 只保存到当前 Mac 的钥匙串。
+4. 双击 `start.command`；保持 Terminal 窗口开启，等待浏览器自动打开。
+5. 页面显示“真实 API · SiliconFlow”后，先输入文字测试，再允许浏览器使用麦克风。
+6. 使用结束后，在启动服务的 Terminal 窗口按 `Control-C` 停止。
+
+可以直接尝试：
+
+```text
+现在几点？
+上海现在天气怎么样？
+播放音乐
+把音乐音量调到 35
+记住我喜欢爵士乐
+你还记得我什么吗？
+忘记爵士乐
+```
+
+### 第一次启用 SiliconFlow
+
+API Key 不要发到聊天里，也不要写进代码。
+
+1. 确认 SiliconFlow 账户已经完成平台要求的实名认证；官方说明免费模型在认证后可用。
+2. 双击 `configure_api_key.command`（默认就是 SiliconFlow 配置）。
+3. 按窗口提示粘贴 API Key，然后按回车。输入时屏幕不会显示字符。
+4. Key 会保存到 macOS 钥匙串，不会写入项目文件或网页。
+5. 双击 `start.command`。浏览器会自动打开 Demo。
+6. 页面右上角显示“真实 API · SiliconFlow”后，就可以先输入文字测试，再点击中央按钮测试麦克风。
+
+下载或接收压缩包后，应先完整解压到“下载”或“文稿”目录。第一次打开未签名的 `.command` 脚本时，macOS 可能要求确认来源；只在确认分享者可信且压缩包未被修改的情况下，通过右键“打开”或“系统设置 → 隐私与安全性 → 仍要打开”批准。不要关闭 Gatekeeper，也不要在压缩包内部直接运行脚本。
+
+如果旧的演示模式仍在运行，启动器会为 SiliconFlow 模式自动选择另一个可用端口并打开，不会再报“Address already in use”。启动窗口按 `Control-C` 可停止对应服务。
+
+## 开发日志
+
+### 2026-09-01 · v0.2
+
+#### 目前实现的功能
+
+- Mac 浏览器录音与文字输入，SiliconFlow 语音转写和大模型回答，Mac 系统语音朗读。
+- ToolRouter 固定白名单工具路由与 SiliconFlow Function Calling。
+- 本地时间与 Open-Meteo 当前天气查询。
+- SomaFM Groove Salad 白名单网络电台，支持播放、暂停、继续、停止和音量控制。
+- AudioFocusManager：录音、思考和朗读时暂停音乐，结束后按条件自动恢复。
+- SQLite 显式长期记忆：记住、查询、逐条删除、确认后全部清空；敏感信息拒绝保存或仅留本机。
+- 本地演示模式、随机本地访问令牌、Host/Origin/Content-Type 校验和 macOS 钥匙串保存 API Key。
+- SiliconFlow 与可选 OpenAI provider 分离，云端失败时保留文字结果或安全降级。
+
+#### 已排除/修复的 Bug
+
+- 修复端口 `8765` 被占用时启动失败：识别兼容实例，否则自动选择可用端口。
+- 修复 SiliconFlow Key 与旧 OpenAI Key 混淆、导致进入错误 provider 的问题。
+- 修复第二轮录音遇到 `socket.timeout` 后界面长期停留在“正在转录”的问题：超时被正确分类，失败后恢复可操作状态。
+- 修复部分免费 ASR 模型连续调用出现 `503` 或超时的问题：默认改用 `TeleAI/TeleSpeechASR`，并为可重试的语音识别故障增加一次有上限的重试。
+- 修复音乐与语音回答共用播放器、互相中断的问题：拆分独立播放器并统一管理音频焦点。
+- 修复音量 `1` 被误解释为 `100%` 的问题；工具音量现在始终按 `0–100` 百分比处理。
+- 修复否定命令可能被本地兜底路由反向执行的问题，例如“不要播放音乐”不再触发播放。
+- 修复模糊“忘记”可能删除语义相反记忆的问题；不明确的删除要求改为页面确认。
+- 修复不同人物的地点记忆可能互相覆盖，以及敏感记忆可能进入云端上下文的问题。
+- 修复旧网页或旧服务被误认为新版本的问题：加入构建标识、健康检查和 provider 校验。
+- 补齐 favicon，消除启动日志中的无意义 `404`。
+
+#### 存在的问题
+
+#### 待开发功能
+
+## 当前免费链路
+
+- 语音识别：`TeleAI/TeleSpeechASR`
+- 文字回答：`Qwen/Qwen3.5-4B`
+- 回答朗读：这台 Mac / 浏览器提供的系统语音，不调用 SiliconFlow 云端 TTS
+
+## 新增能力
+
+### 本地长期记忆
+
+长期记忆使用 Python 自带的 SQLite，只保存用户明确要求记住的短文字，不保存原始录音。可以直接说或输入：
+
+```text
+记住我喜欢爵士乐
+你还记得我什么吗？
+忘记爵士乐
+```
+
+页面下方可以查看、逐条删除或二次确认后全部清空。清空“本次对话”只清短期会话，不会删除长期记忆。
+
+macOS 默认数据库位置：
+
+```text
+~/Library/Application Support/Xiaoshengchang/memory.sqlite3
+```
+
+程序新建的数据目录会尽力设置为 `0700`，数据库设置为 `0600`，并启用 SQLite `secure_delete`。也可以在启动前设置 `SMART_SPEAKER_DATA_DIR` 改变数据目录。不要把数据库作为普通附件分享，它可能包含私人偏好。
+
+程序会把常见住址、联系方式、健康和财务信息标记成“仅本机私密”：它们可以在页面查看和删除，但不会被选入云端模型上下文。API Key、密码和令牌等凭据会被拒绝保存。该分类是保守的本地规则，不应代替你自己判断；不想保留的信息请及时删除。
+
+### 白名单网络电台
+
+页面内置一个固定白名单电台：SomaFM Groove Salad，使用电台官方公布的 128 kbps MP3 直播流。可以点击页面按钮，也可以说：
+
+```text
+播放音乐
+暂停音乐
+继续播放
+停止音乐
+把音乐音量调到 35
+```
+
+白名单来源：[SomaFM Groove Salad 官方直连页](https://somafm.com/groovesalad/directstreamlinks.html)。播放器只接受本地后端给出的 `station_id`，大模型不能传入任意网址。播放时会直接连接 SomaFM，因此电台服务能看到正常网络连接所需的 IP 和请求信息。
+
+音乐与回答使用独立播放器。录音或文字提问开始时，正在播放的音乐会暂停；回答朗读结束后，在用户没有要求停止或换歌的情况下自动恢复。
+
+### 本地时间、天气和 Function Calling
+
+SiliconFlow Chat Completions 会收到严格限制的工具说明。当前允许的工具只有：本地时间、Open-Meteo 当前天气和白名单音乐控制。工具名称、字段和范围都会由本地 Python 再次验证；不会使用 `eval`，不会执行模型提供的命令、文件路径、SQL 或任意 URL。
+
+天气使用免 Key 的 [Open-Meteo Geocoding API](https://open-meteo.com/en/docs/geocoding-api) 和 [Forecast API](https://open-meteo.com/en/docs)。查询天气时，城市名称会发送给 Open-Meteo；结果缓存 10 分钟。可以说：
+
+```text
+现在几点？
+上海现在天气怎么样？
+```
+
+截至 2026-09-01，本机真实 API 自检已确认 `Qwen/Qwen3.5-4B` 能调用 `get_local_time` 并完成第二轮回答。模型能力可能调整；若工具参数暂不受模型支持，程序会对时间、天气和音乐命令使用同样受限的本地解析兜底，不会开放额外权限。
+
+截至 2026-08-31，SiliconFlow 官方资料把 `TeleAI/TeleSpeechASR` 列为免费 ASR，并明确列入标准语音转文字接口支持范围；它在本机连续两轮测试中都约 3 秒完成。此前测试的 `Qwen/Qwen3-ASR-1.7B` 虽在价格页标为免费，但连续调用时第二轮多次超时，因此不再作为默认模型；`SenseVoiceSmall` 在本机测试中持续返回上游 503。免费模型仍有账户级调用频率限制；达到限额时会返回 429，需要稍后重试。模型与免费状态可能调整，请以 [SiliconFlow 免费 ASR 说明](https://docs.siliconflow.cn/cn/usercases/use-siliconcloud-in-BiBiKeyboard)、[实时价格页](https://siliconflow.cn/pricing) 和 [免费模型限额说明](https://docs.siliconflow.cn/cn/userguide/rate-limits/rate-limit-and-upgradation) 为准。
+
+接口依据：
+
+- [语音转文字 API](https://docs.siliconflow.cn/cn/api-reference/audio/create-audio-transcriptions)
+- [Chat Completions API](https://docs.siliconflow.cn/cn/api-reference/chat-completions/chat-completions)
+
+## 隐私与数据流向
+
+SiliconFlow 模式会把本轮录音发送给 SiliconFlow 做语音识别，再把转录文字、系统提示、最近最多 2 轮对话和与当前问题最相关的最多 5 条非敏感长期记忆发送给文字模型。录音只在内存中处理，本地服务不会把它写入磁盘；停止服务后，本地内存中的短期对话历史会清空，显式长期记忆继续保存在本机 SQLite 中。
+
+“长期记忆保存在本地”不表示它永远不会进入云端：为了回答当前问题而选中的少量相关、非敏感记忆，会作为明确标注的事实数据发送给当前大模型。程序识别出的 API Key、密码、令牌、二进制录音和标为敏感的记忆不会进入该上下文。可选 OpenAI 模式也遵循同一规则，会把选中的非敏感记忆发送给 OpenAI。
+
+API Key 只从 macOS 钥匙串读入本机 Python 进程：不会进入网页、URL、对话历史或接口响应。服务只监听 `127.0.0.1`，并校验每次启动生成的随机令牌、Host、Origin 和内容类型。
+
+## 不配置 Key 也能体验
+
+直接双击 `start.command`。没有可用 Key 时会进入本地演示：可以验证麦克风权限、录音、朗读、本地时间、长期记忆和音乐界面，但不会把录音或文字发送给 SiliconFlow，也不会生成真实大模型答案。演示模式下天气不会联网，页面会提示先配置真实联网模式。
+
+## 麦克风权限排查
+
+如果误点了“不允许”：
+
+1. 打开“系统设置 → 隐私与安全性 → 麦克风”。
+2. 为正在使用的 Chrome 或 Safari 开启权限。
+3. 回到页面刷新后再试。
+
+浏览器会请求回声消除、降噪和自动增益。当前是半双工：播放回答时不会同时录音，以免扬声器的声音再次被麦克风收进去。
+
+## 可选配置
+
+默认会优先使用已保存的 SiliconFlow Key。可在启动前设置：
+
+```text
+SILICONFLOW_TRANSCRIBE_MODEL=TeleAI/TeleSpeechASR
+SILICONFLOW_TEXT_MODEL=Qwen/Qwen3.5-4B
+SILICONFLOW_REQUEST_TIMEOUT=60
+SMART_SPEAKER_MODE=auto|mock|siliconflow|openai
+SMART_SPEAKER_DATA_DIR=/自定义/本地数据目录
+```
+
+模型名称会在本地校验，API Base URL 固定为官方 `https://api.siliconflow.cn/v1`，不能通过环境变量重定向，以免钥匙串中的 Key 被发送到其他地址。
+
+原来的 OpenAI 模式仍保留。需要时可双击 `optional_configure_openai_key.command` 保存 OpenAI Key，并以 `SMART_SPEAKER_MODE=openai` 明确启动。默认自动模式只选择 SiliconFlow；没有 SiliconFlow Key 时进入本地演示，不会悄悄回退到 OpenAI。
+
+## 手动启动与自检
+
+在项目目录运行：
+
+```text
+python3 app.py
+```
+
+运行自动测试：
+
+```text
+python3 -m unittest discover -s tests -v
+```
