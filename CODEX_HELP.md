@@ -19,7 +19,7 @@
 - 真实模式会把录音、转录、最近最多 2 轮对话和最多 5 条相关的非敏感长期记忆发送给 SiliconFlow；原始录音不会由本 Demo 写盘。
 - API Key 保存在当前 macOS 用户的钥匙串服务 `Smart Speaker Demo - SiliconFlow API Key` 中，不在网页或项目文件中。
 - `memory_store.py` 使用 SQLite 保存用户明确要求记住的短文字。默认路径是 `~/Library/Application Support/Xiaoshengchang/memory.sqlite3`；清空短期会话绝不能删除它。
-- `tool_router.py` 是固定允许列表，只能访问本地时间、Open-Meteo 固定域名和白名单音乐控制。不得把模型输出当作命令、SQL、路径或 URL 执行。
+- `tool_router.py` 是固定允许列表，只能访问本地时间、Open-Meteo 固定域名、实验性的 Bing RSS 固定搜索主机和白名单音乐控制。搜索只读取标题、摘要和来源域名，不打开结果链接。不得把模型输出或网页摘要当作命令、SQL、路径或 URL 执行。
 - 网络电台 URL 只来自后端 `RADIO_STATIONS` 常量；模型工具结果和会话历史只携带 `station_id`，不携带流地址。
 - 浏览器中的 `MusicPlayer` 与回答朗读完全分离；`AudioFocusManager` 在录音、思考和朗读期间暂停音乐，结束后按条件恢复。
 - 常见住址、联系方式、健康与财务记忆会标记为 `sensitive` 并留在本机。它们可以在页面查看和删除，但不得放入模型上下文。
@@ -48,6 +48,7 @@
 - 有文字无声音：检查系统输出和 Web Speech 可用语音；文字结果仍是有效降级。
 - 电台无法自动播放：浏览器可能要求一次用户手势，让使用者在电台卡片上手动点击“播放”。不要通过放宽 URL 白名单解决。
 - 天气不可用：本地时间、记忆和音乐控制仍可用；检查 Open-Meteo 连通性，但不得把 SiliconFlow Authorization 头发往天气服务。
+- 联网搜索不可用：确认处于真实模式并检查 Bing 连通性；RSS 路径是实验性能力，可能临时返回空内容或停止服务。不得把任何 API Key、Cookie 或模型 Authorization 头发往搜索服务。
 - “忘记……”提示到页面确认：这是防止模糊语句误删的正常保护。
 
 ## 验证命令

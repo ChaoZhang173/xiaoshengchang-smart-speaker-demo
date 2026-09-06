@@ -173,6 +173,45 @@ class RaisingOpener:
         raise self.error
 
 
+class FakeSearchClient:
+    def __init__(self, error=None):
+        self.queries = []
+        self.error = error
+
+    def search(self, query):
+        self.queries.append(query)
+        if self.error:
+            raise self.error
+        return {
+            "source": "Bing RSS（实验性）",
+            "query": query,
+            "results": [
+                {
+                    "title": "联网搜索测试结果",
+                    "snippet": "这是作为不可信数据传给模型的网页摘要。",
+                    "domain": "example.com",
+                }
+            ],
+        }
+
+
+class FakeWeatherClient:
+    def __init__(self):
+        self.cities = []
+
+    def current(self, city):
+        self.cities.append(city)
+        return {
+            "source": "Open-Meteo",
+            "location": city,
+            "condition": "晴",
+            "temperature_c": 25.0,
+            "apparent_temperature_c": 26.0,
+            "relative_humidity_percent": 60,
+            "wind_speed_kmh": 5.0,
+        }
+
+
 class RetryOnceSiliconFlowClient(app.SiliconFlowHTTPClient):
     def __init__(self, config, retryable=True):
         super().__init__(config)
@@ -463,6 +502,116 @@ class CoreTests(unittest.TestCase):
             "ice5.somafm.com", json.dumps(second_payload, ensure_ascii=False)
         )
 
+    def test_siliconflow_web_search_function_call_uses_local_fixed_client(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        search = FakeSearchClient()
+        router = app.ToolRouter(search_client=search)
+        client = FunctionCallingSiliconFlowClient(
+            config,
+            tool_name="web_search",
+            arguments={"query": "PRIVATE_MEMORY_SHOULD_NOT_LEAK"},
+        )
+        turn = client.respond_with_tools(
+            "联网搜索 OpenAI 最新消息", [], router
+        )
+        self.assertEqual(search.queries, ["OpenAI 最新消息"])
+        self.assertEqual(turn.tools_used, ["web_search"])
+        self.assertEqual(len(client.calls), 2)
+        tool_message = client.calls[1]["payload"]["messages"][-1]
+        self.assertEqual(tool_message["role"], "tool")
+        self.assertIn("example.com", tool_message["content"])
+        self.assertNotIn("https://", tool_message["content"])
+        self.assertNotIn("PRIVATE_MEMORY_SHOULD_NOT_LEAK", tool_message["content"])
+
+    def test_model_cannot_force_search_without_local_search_intent(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        search = FakeSearchClient()
+        router = app.ToolRouter(search_client=search)
+        client = FunctionCallingSiliconFlowClient(
+            config,
+            tool_name="web_search",
+            arguments={"query": "模型擅自添加的查询"},
+        )
+        turn = client.respond_with_tools("这是我的私人备忘，不要对外发送", [], router)
+        self.assertIn("没有发送", turn.text)
+        self.assertEqual(turn.tools_used, ["web_search:guard"])
+        self.assertEqual(search.queries, [])
+        self.assertEqual(len(client.calls), 1)
+
+    def test_siliconflow_weather_call_is_bound_to_the_users_city(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        weather = FakeWeatherClient()
+        router = app.ToolRouter(weather_client=weather)
+        client = FunctionCallingSiliconFlowClient(
+            config,
+            tool_name="get_weather",
+            arguments={"city": "上海"},
+        )
+        turn = client.respond_with_tools("北京现在天气", [], router)
+        self.assertEqual(weather.cities, ["北京"])
+        self.assertEqual(turn.tools_used, ["get_weather"])
+        self.assertEqual(len(client.calls), 2)
+
+    def test_siliconflow_weather_call_cannot_bypass_local_boundaries(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        for text, expected in (
+            ("上海明天天气", "未来或历史"),
+            ("上海和北京天气", "一次只查询一个城市"),
+            ("今天天气怎么样", "哪个城市"),
+        ):
+            with self.subTest(text=text):
+                weather = FakeWeatherClient()
+                router = app.ToolRouter(weather_client=weather)
+                client = FunctionCallingSiliconFlowClient(
+                    config,
+                    tool_name="get_weather",
+                    arguments={"city": "上海"},
+                )
+                turn = client.respond_with_tools(text, [], router)
+                self.assertIn(expected, turn.text)
+                self.assertEqual(turn.tools_used, ["get_weather:guard"])
+                self.assertEqual(weather.cities, [])
+                self.assertEqual(len(client.calls), 1)
+
+    def test_failed_realtime_tool_is_not_rewritten_by_the_model(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        search = FakeSearchClient(app.ToolNetworkError("搜索服务暂时不可用。"))
+        router = app.ToolRouter(search_client=search)
+        client = FunctionCallingSiliconFlowClient(
+            config,
+            tool_name="web_search",
+            arguments={"query": "测试消息"},
+        )
+        turn = client.respond_with_tools("联网搜索测试消息", [], router)
+        self.assertEqual(turn.text, "搜索服务暂时不可用。")
+        self.assertEqual(turn.tools_used, ["web_search:error"])
+        self.assertEqual(len(client.calls), 1)
+
     def test_tools_unsupported_fallback_keeps_selected_memory_context(self):
         config = app.AppConfig(
             provider_id="siliconflow",
@@ -580,6 +729,33 @@ class CoreTests(unittest.TestCase):
         result = pipeline.process_text("现在几点？", self.session_id)
         self.assertIn("get_local_time", result["tools_used"][0])
         self.assertEqual(client.calls, [])
+
+    def test_openai_mode_uses_local_router_for_explicit_search(self):
+        config = app.AppConfig(
+            provider_id="openai",
+            api_key="test-key",
+            api_base="https://api.openai.com/v1",
+            text_model="gpt-test",
+        )
+        search = FakeSearchClient()
+        router = app.ToolRouter(search_client=search)
+        client = RecordingOpenAIClient(config)
+        pipeline = app.VoicePipeline(config, tool_router=router)
+        pipeline.client = client
+        result = pipeline.process_text(
+            "联网搜索 OpenAI 最新消息", self.session_id
+        )
+        self.assertEqual(search.queries, ["OpenAI 最新消息"])
+        self.assertIn("web_search", result["tools_used"][0])
+        self.assertIn("example.com", result["reply"])
+        self.assertEqual(client.calls, [])
+
+        implicit = pipeline.process_text(
+            "今天有什么最新科技新闻", self.session_id
+        )
+        self.assertEqual(search.queries[-1], "今天有什么最新科技新闻")
+        self.assertIn("web_search", implicit["tools_used"][0])
+        self.assertIn("最新、实时或近期新闻", pipeline.health()["privacy_notice"])
 
     def test_selected_memory_is_bounded_inside_system_message(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -848,10 +1024,14 @@ class LocalHTTPTests(unittest.TestCase):
         status, payload = self.get_json("/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(payload["app"], "smart-speaker-demo")
-        self.assertEqual(payload["build_id"], "tools-memory-radio-v1")
+        self.assertEqual(
+            payload["build_id"], "tools-memory-radio-search-weather-v2"
+        )
         self.assertEqual(payload["mode"], "mock")
         self.assertEqual(payload["provider_id"], "mock")
         self.assertFalse(payload["real_api_enabled"])
+        self.assertTrue(payload["capabilities"]["web_search"])
+        self.assertFalse(payload["capabilities"]["network_tools_enabled"])
         self.assertTrue(payload["request_token"])
 
     def test_home_page(self):

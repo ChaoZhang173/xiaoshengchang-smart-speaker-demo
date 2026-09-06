@@ -1,7 +1,7 @@
 "use strict";
 
 const MAX_RECORDING_MS = 30_000;
-const REQUEST_TIMEOUT_MS = 200_000;
+const REQUEST_TIMEOUT_MS = 240_000;
 const MUSIC_REQUEST_TIMEOUT_MS = 20_000;
 
 const states = Object.freeze({
