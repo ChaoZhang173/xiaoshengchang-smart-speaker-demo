@@ -269,6 +269,15 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(result["audio_base64"])
         self.assertTrue(result["use_browser_tts"])
 
+    def test_mock_local_tool_runs_through_policy_and_execution_ledger(self):
+        result = self.pipeline.process_text("现在几点？", self.session_id)
+
+        self.assertEqual(result["tools_used"], ["get_local_time:local_demo"])
+        record = self.pipeline.execution_ledger.recent(1)[0]
+        self.assertEqual(record.operation, "get_local_time")
+        self.assertEqual(record.status, "succeeded")
+        self.assertEqual(record.metadata["policy_decision"], "allow")
+
     def test_mock_audio_turn_marks_transcript_as_placeholder(self):
         result = self.pipeline.process_audio(
             b"not-real-audio-but-nonempty",
@@ -548,6 +557,180 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(search.queries, [])
         self.assertEqual(len(client.calls), 1)
 
+    def test_model_cannot_force_weather_without_local_weather_intent(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        weather = FakeWeatherClient()
+        router = app.ToolRouter(weather_client=weather)
+        client = FunctionCallingSiliconFlowClient(
+            config,
+            tool_name="get_weather",
+            arguments={"city": "PRIVATE_MEMORY_CITY"},
+        )
+
+        turn = client.respond_with_tools(
+            "这是我的私人备忘，不要对外发送",
+            [],
+            router,
+        )
+
+        self.assertIn("没有发送", turn.text)
+        self.assertEqual(turn.tools_used, ["get_weather:guard"])
+        self.assertEqual(weather.cities, [])
+        self.assertEqual(len(client.calls), 1)
+
+    def test_model_tool_calls_cannot_execute_quoted_or_meta_language(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        cases = (
+            (
+                "play_radio",
+                {"station_id": "soma_groove_salad"},
+                "请解释“播放音乐”这个命令",
+            ),
+            (
+                "get_weather",
+                {"city": "模型猜测的城市"},
+                "我的住址是北京朝阳区建国路88号请解释天气这个词",
+            ),
+            (
+                "get_weather",
+                {"city": "模型猜测的城市"},
+                "联网搜索 北京天气",
+            ),
+            (
+                "get_weather",
+                {"city": "模型猜测的城市"},
+                "我患有抑郁症请查询上海天气",
+            ),
+            (
+                "get_weather",
+                {"city": "模型猜测的城市"},
+                "我怀孕了上海天气怎么样",
+            ),
+            (
+                "web_search",
+                {"query": "模型拼接的私密内容"},
+                "这不是最新消息，我的邮箱是alice@example.com",
+            ),
+            (
+                "web_search",
+                {"query": "alice@example.com 是什么意思"},
+                "请问联网搜索 alice@example.com 是什么意思",
+            ),
+            (
+                "web_search",
+                {"query": "alice@example.com"},
+                "联网搜索 alice@example.com，我只是在转述",
+            ),
+            (
+                "web_search",
+                {"query": "模型拼接的私密内容"},
+                "联网搜索 OpenAI 最新消息，然后记住我的密码是 hunter2",
+            ),
+        )
+        for tool_name, arguments, text in cases:
+            with self.subTest(tool_name=tool_name):
+                weather = FakeWeatherClient()
+                search = FakeSearchClient()
+                router = app.ToolRouter(
+                    weather_client=weather,
+                    search_client=search,
+                )
+                client = FunctionCallingSiliconFlowClient(
+                    config,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                )
+
+                turn = client.respond_with_tools(text, [], router)
+
+                self.assertEqual(turn.client_actions, [])
+                self.assertEqual(turn.tools_used, [tool_name + ":guard"])
+                self.assertEqual(weather.cities, [])
+                self.assertEqual(search.queries, [])
+                self.assertEqual(len(client.calls), 1)
+
+    def test_model_search_exports_only_the_standalone_request_clause(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        search = FakeSearchClient()
+        router = app.ToolRouter(search_client=search)
+        client = FunctionCallingSiliconFlowClient(
+            config,
+            tool_name="web_search",
+            arguments={"query": "模型拼接的整段私密上下文"},
+        )
+
+        turn = client.respond_with_tools(
+            "我工资三万元，今天有哪些最新财经消息？",
+            [],
+            router,
+        )
+
+        self.assertEqual(search.queries, ["今天有哪些最新财经消息"])
+        self.assertEqual(turn.tools_used, ["web_search"])
+        self.assertEqual(len(client.calls), 2)
+
+    def test_gateway_requires_positive_music_intent_from_current_user(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        client = FunctionCallingSiliconFlowClient(config)
+        pipeline = app.VoicePipeline(config)
+        pipeline.client = client
+
+        result = pipeline.process_text(
+            "给我介绍一下爵士乐的历史",
+            self.session_id,
+        )
+
+        self.assertIn("没有明确授权", result["reply"])
+        self.assertEqual(result["client_actions"], [])
+        self.assertEqual(result["tools_used"], ["play_radio:guard"])
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(pipeline.execution_ledger.recent(), [])
+
+    def test_gateway_issues_only_router_authorized_music_action(self):
+        config = app.AppConfig(
+            provider_id="siliconflow",
+            api_key="test-key",
+            api_base="https://api.siliconflow.cn/v1",
+            text_model="Qwen/Qwen3.5-4B",
+        )
+        client = FunctionCallingSiliconFlowClient(
+            config,
+            arguments={"station_id": "model_attempted_other_station"},
+        )
+        pipeline = app.VoicePipeline(config)
+        pipeline.client = client
+
+        result = pipeline.process_text("播放音乐", self.session_id)
+
+        self.assertEqual(
+            result["client_actions"],
+            [{"type": "music.play", "station_id": "soma_groove_salad"}],
+        )
+        self.assertEqual(
+            pipeline.execution_ledger.recent(1)[0].status,
+            "dispatched",
+        )
+
     def test_siliconflow_weather_call_is_bound_to_the_users_city(self):
         config = app.AppConfig(
             provider_id="siliconflow",
@@ -678,6 +861,28 @@ class CoreTests(unittest.TestCase):
             self.assertIn("页面", result["reply"])
             self.assertEqual(len(store.list_memories()), 1)
 
+    def test_voice_forget_never_echoes_or_deletes_private_matches(self):
+        for query in ("忘记我", "忘记我的", "忘记手机号"):
+            with self.subTest(query=query), tempfile.TemporaryDirectory() as directory:
+                store = app.MemoryStore(Path(directory) / "memory.sqlite3")
+                pipeline = app.VoicePipeline(
+                    app.AppConfig(provider_id="mock", api_key=""),
+                    memory_store=store,
+                )
+                pipeline.process_text(
+                    "记住我的手机号是13800138000",
+                    self.session_id,
+                )
+                pipeline.process_text("记住我有高血压", self.session_id)
+
+                result = pipeline.process_text(query, self.session_id)
+
+                self.assertIn("页面", result["reply"])
+                self.assertNotIn("13800138000", result["reply"])
+                self.assertNotIn("高血压", result["reply"])
+                self.assertFalse(result["memory_changed"])
+                self.assertEqual(len(store.list_memories()), 2)
+
     def test_place_memories_for_other_people_do_not_overwrite_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             store = app.MemoryStore(Path(directory) / "memory.sqlite3")
@@ -715,6 +920,65 @@ class CoreTests(unittest.TestCase):
         ):
             with self.subTest(summary=summary):
                 self.assertTrue(app.VoicePipeline._memory_is_sensitive(summary))
+
+    def test_health_memories_stay_local_and_out_of_cloud_context(self):
+        for summary in (
+            "我患有抑郁症",
+            "我得了癌症",
+            "我怀孕了",
+            "I have cancer",
+            "I am pregnant",
+            "I was diagnosed with depression",
+            "我的秘密是蓝鲸",
+            "这是我的隐私信息",
+            "我的性取向是同性恋",
+            "My religion is Buddhist",
+            "我住上海",
+            "我的住址是北京",
+            "我的地址是上海",
+            "我家位于深圳",
+            "我年薪三十万",
+            "我有存款一百万",
+            "我得高血压",
+            "我是艾滋病患者",
+            "我有糖尿病",
+        ):
+            with self.subTest(summary=summary), tempfile.TemporaryDirectory() as directory:
+                store = app.MemoryStore(Path(directory) / "memory.sqlite3")
+                pipeline = app.VoicePipeline(
+                    app.AppConfig(provider_id="mock", api_key=""),
+                    memory_store=store,
+                )
+
+                saved = pipeline.process_text("记住" + summary, self.session_id)
+
+                self.assertIn("仅本机", saved["reply"])
+                record = store.list_memories()[0]
+                self.assertTrue(record.sensitive)
+                self.assertEqual(
+                    store.select_context(summary, include_sensitive=False),
+                    [],
+                )
+
+    def test_legacy_sensitive_memory_is_reclassified_before_cloud_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = app.MemoryStore(Path(directory) / "memory.sqlite3")
+            legacy = store.remember(
+                "我患有抑郁症",
+                kind="preference",
+                sensitive=False,
+            )
+            pipeline = app.VoicePipeline(
+                app.AppConfig(provider_id="mock", api_key=""),
+                memory_store=store,
+            )
+
+            self.assertFalse(legacy.sensitive)
+            self.assertEqual(
+                store.select_context("抑郁症", include_sensitive=False),
+                [],
+            )
+            self.assertTrue(pipeline.list_memories()[0]["sensitive"])
 
     def test_openai_mode_uses_local_router_for_time_without_cloud_call(self):
         config = app.AppConfig(
@@ -1025,12 +1289,16 @@ class LocalHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["app"], "smart-speaker-demo")
         self.assertEqual(
-            payload["build_id"], "tools-memory-radio-search-weather-v2"
+            payload["build_id"], "agent-foundation-v1"
         )
         self.assertEqual(payload["mode"], "mock")
         self.assertEqual(payload["provider_id"], "mock")
         self.assertFalse(payload["real_api_enabled"])
         self.assertTrue(payload["capabilities"]["web_search"])
+        self.assertTrue(payload["capabilities"]["agent_gateway"])
+        self.assertTrue(payload["capabilities"]["brain_adapter"])
+        self.assertTrue(payload["capabilities"]["execution_ledger"])
+        self.assertTrue(payload["capabilities"]["policy_engine"])
         self.assertFalse(payload["capabilities"]["network_tools_enabled"])
         self.assertTrue(payload["request_token"])
 

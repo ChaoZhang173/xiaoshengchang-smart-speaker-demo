@@ -33,11 +33,16 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from agent_gateway import AgentGateway, GovernedToolRouter
+from brain_adapter import AssistantTurn, BrainRequest, CallbackBrainAdapter
+from execution_ledger import ExecutionLedger
 from memory_store import (
     MemoryStore,
     MemoryStoreError,
     MemoryValidationError,
 )
+from policy_engine import PolicyEngine
+from privacy_guard import is_sensitive_memory_text
 from tool_router import (
     ToolExecution,
     ToolInputError,
@@ -49,7 +54,7 @@ from tool_router import (
 
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "static"
-BUILD_ID = "tools-memory-radio-search-weather-v2"
+BUILD_ID = "agent-foundation-v1"
 MAX_AUDIO_BYTES = 15 * 1024 * 1024
 MAX_TEXT_CHARS = 4_000
 SILICONFLOW_ASR_ATTEMPT_TIMEOUT = 35
@@ -105,13 +110,6 @@ class NoRedirectHandler(HTTPRedirectHandler):
                          headers: Any, newurl: str) -> None:
         del req, fp, code, msg, headers, newurl
         return None
-
-
-@dataclass
-class AssistantTurn:
-    text: str
-    client_actions: list = field(default_factory=list)
-    tools_used: list = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -755,6 +753,42 @@ class SiliconFlowHTTPClient(ProviderHTTPClient):
             if isinstance(function, dict):
                 tool_name = str(function.get("name", "")).strip()
                 guarded_arguments: Optional[Dict[str, Any]] = None
+                user_bound_tools = {
+                    "get_weather",
+                    "web_search",
+                    "play_radio",
+                    "pause_music",
+                    "resume_music",
+                    "stop_music",
+                    "set_music_volume",
+                }
+                authorized = (
+                    router.authorized_intent(text)
+                    if tool_name in user_bound_tools
+                    else None
+                )
+                if tool_name in user_bound_tools and (
+                    authorized is None
+                    or authorized.get("tool_name") != tool_name
+                ):
+                    if tool_name == "get_weather":
+                        message = (
+                            "这条指令没有明确要求通过天气服务查询当前天气，"
+                            "我没有发送任何地点信息。需要查询时，请说"
+                            "“查询上海现在的天气”。"
+                        )
+                    elif tool_name == "web_search":
+                        message = (
+                            "这条指令没有明确要求联网搜索，我没有发送任何搜索内容。"
+                            "需要联网时，请说“联网搜索……”。"
+                        )
+                    else:
+                        message = "当前指令没有明确授权这个音乐操作，操作没有执行。"
+                    return AssistantTurn(
+                        message,
+                        [],
+                        [tool_name + ":guard"],
+                    )
                 if tool_name == "get_weather":
                     weather_guard = router.weather_guard(text)
                     if weather_guard is not None:
@@ -763,19 +797,24 @@ class SiliconFlowHTTPClient(ProviderHTTPClient):
                             [],
                             ["get_weather:guard"],
                         )
-                    weather_intent = router.weather_intent(text)
-                    if weather_intent is not None:
-                        city = str(weather_intent.get("city", "")).strip()
-                        if city:
-                            # The user's current words authorize the city.  Do
-                            # not let a model substitute a different location.
-                            guarded_arguments = {"city": city}
+                    city = str(authorized["arguments"].get("city", "")).strip()
+                    if not city:
+                        return AssistantTurn(
+                            "你想查询哪个城市的天气？",
+                            [],
+                            ["get_weather:guard"],
+                        )
+                    # The user's current words authorize the city. Do not let
+                    # a model substitute a different location.
+                    guarded_arguments = {"city": city}
                 elif tool_name == "web_search":
                     # Derive the outgoing search from the current user turn,
                     # never from model-added memory or arbitrary tool text.  A
                     # model-selected tool is not permission to send unrelated
                     # user text to a third party.
-                    search_query = router.search_query_for_text(text)
+                    search_query = str(
+                        authorized["arguments"].get("query", "")
+                    ).strip()
                     if not search_query:
                         return AssistantTurn(
                             "这条指令没有明确要求联网搜索，我没有发送任何搜索内容。"
@@ -784,6 +823,14 @@ class SiliconFlowHTTPClient(ProviderHTTPClient):
                             ["web_search:guard"],
                         )
                     guarded_arguments = {"query": search_query}
+                elif tool_name in {
+                    "play_radio",
+                    "pause_music",
+                    "resume_music",
+                    "stop_music",
+                    "set_music_volume",
+                }:
+                    guarded_arguments = dict(authorized["arguments"])
                 if guarded_arguments is not None:
                     guarded_call = dict(guarded_call)
                     guarded_function = dict(function)
@@ -956,6 +1003,30 @@ class VoicePipeline:
             self.client = OpenAIHTTPClient(config)
         else:
             self.client = None
+        self.policy = PolicyEngine()
+        self.execution_ledger = ExecutionLedger()
+        self.brain = CallbackBrainAdapter(
+            config.provider_id,
+            responder=self._respond_with_client,
+            transcriber=(
+                self._transcribe_with_client if config.mode == "real" else None
+            ),
+            synthesizer=(
+                self._synthesize_with_client if config.uses_cloud_tts else None
+            ),
+        )
+        self.gateway = AgentGateway(
+            brain=self.brain,
+            sessions=self.sessions,
+            memories=self.memories,
+            tools=self.tools,
+            policy=self.policy,
+            ledger=self.execution_ledger,
+            local_responder=self._local_response,
+            uses_cloud_tts=config.uses_cloud_tts,
+            memory_error_types=(MemoryStoreError, MemoryValidationError),
+            speech_error_types=(UpstreamAPIError,),
+        )
 
     def health(self) -> Dict[str, Any]:
         if self.config.provider_id == "siliconflow":
@@ -1001,7 +1072,11 @@ class VoicePipeline:
             "privacy_notice": privacy_notice,
             "conversation_memory": "local_sqlite_explicit",
             "capabilities": {
+                "agent_gateway": True,
+                "brain_adapter": True,
+                "execution_ledger": True,
                 "long_term_memory": True,
+                "policy_engine": True,
                 "tool_router": True,
                 "siliconflow_function_calling": (
                     self.config.provider_id == "siliconflow"
@@ -1027,20 +1102,7 @@ class VoicePipeline:
         memory_result = self._handle_memory_command(clean)
         if memory_result is not None:
             return memory_result
-        if self.config.provider_id == "mock":
-            local_tool = self.tools.deterministic_match(clean, allow_network=False)
-            if local_tool is not None:
-                return self._result(
-                    clean,
-                    local_tool.spoken_fallback,
-                    None,
-                    False,
-                    client_actions=local_tool.client_actions,
-                    tools_used=[local_tool.name + ":local_demo"],
-                )
-            reply = self._mock_reply(clean)
-            return self._result(clean, reply, None, False)
-        return self._run_cloud(clean, session_id)
+        return self._run_agent(clean, session_id)
 
     def process_audio(
         self,
@@ -1062,74 +1124,109 @@ class VoicePipeline:
                 "这里会显示真实转录，并由大模型生成回答。"
             )
             return self._result(transcript, reply, None, True)
-        assert self.client is not None
-        transcript = self.client.transcribe(audio, mime, suffix)
+        transcript = self.gateway.transcribe(audio, mime, suffix)
         memory_result = self._handle_memory_command(transcript)
         if memory_result is not None:
             memory_result["transcript"] = transcript
             return memory_result
-        return self._run_cloud(transcript, session_id)
+        return self._run_agent(transcript, session_id)
 
     def _run_cloud(self, transcript: str, session_id: str) -> Dict[str, Any]:
-        assert self.client is not None
-        if self.config.provider_id == "openai":
-            local_tool = self.tools.deterministic_match(transcript)
-            if local_tool is not None:
-                return self._result(
-                    transcript,
-                    local_tool.spoken_fallback,
-                    None,
-                    False,
-                    client_actions=local_tool.client_actions,
-                    tools_used=[local_tool.name + ":local_router"],
-                )
-        history = self.sessions.get_history(session_id)
-        try:
-            selected_memories = self.memories.select_context(
-                transcript, limit=5, max_chars=1_200
-            )
-            memory_context = (
-                self.memories.context_for_prompt(selected_memories)
-                if selected_memories
-                else ""
-            )
-        except (MemoryStoreError, MemoryValidationError):
-            memory_context = ""
-        assistant_turn = AssistantTurn("")
-        if isinstance(self.client, SiliconFlowHTTPClient):
-            assistant_turn = self.client.respond_with_tools(
-                transcript,
-                history,
-                self.tools,
-                memory_context,
-            )
-            reply = assistant_turn.text
-        elif isinstance(self.client, OpenAIHTTPClient):
-            reply = self.client.respond(transcript, history, memory_context)
-            assistant_turn = AssistantTurn(reply)
-        else:
-            reply = self.client.respond(transcript, history)  # type: ignore[attr-defined]
-            assistant_turn = AssistantTurn(reply)
-        speech = None
-        tts_warning = None
-        if self.config.uses_cloud_tts:
-            if len(reply) <= 4_000:
-                try:
-                    speech = self.client.synthesize(reply)  # type: ignore[attr-defined]
-                except UpstreamAPIError:
-                    tts_warning = "云端语音合成失败，已改用 Mac 的系统语音。"
-            else:
-                tts_warning = "回答较长，已改用 Mac 的系统语音。"
-        self.sessions.add_turn(session_id, transcript, reply)
+        """Compatibility wrapper retained for callers of the former pipeline."""
+
+        return self._run_agent(transcript, session_id)
+
+    def _run_agent(self, transcript: str, session_id: str) -> Dict[str, Any]:
+        outcome = self.gateway.run(
+            transcript,
+            session_id,
+            allow_network=self.config.mode == "real",
+        )
+        turn = outcome.assistant_turn
         return self._result(
             transcript,
-            reply,
-            speech,
+            turn.text,
+            outcome.speech,
             False,
-            tts_warning,
-            client_actions=assistant_turn.client_actions,
-            tools_used=assistant_turn.tools_used,
+            outcome.tts_warning,
+            client_actions=turn.client_actions,
+            tools_used=turn.tools_used,
         )
+
+    def _local_response(
+        self,
+        transcript: str,
+        tools: GovernedToolRouter,
+    ) -> Optional[AssistantTurn]:
+        if self.config.provider_id == "mock":
+            local_tool = tools.deterministic_match(
+                transcript,
+                allow_network=False,
+            )
+            if local_tool is not None:
+                return AssistantTurn(
+                    local_tool.spoken_fallback,
+                    list(local_tool.client_actions),
+                    [local_tool.name + ":local_demo"],
+                )
+            return AssistantTurn(self._mock_reply(transcript))
+        if self.config.provider_id == "openai":
+            local_tool = tools.deterministic_match(transcript)
+            if local_tool is not None:
+                return AssistantTurn(
+                    local_tool.spoken_fallback,
+                    list(local_tool.client_actions),
+                    [local_tool.name + ":local_router"],
+                )
+        return None
+
+    def _respond_with_client(
+        self,
+        request: BrainRequest,
+        tools: GovernedToolRouter,
+    ) -> AssistantTurn:
+        client = self.client
+        if client is None:
+            raise RuntimeError("The selected brain has no provider client.")
+        if isinstance(client, SiliconFlowHTTPClient):
+            return client.respond_with_tools(
+                request.text,
+                request.history,
+                tools,
+                request.memory_context,
+            )
+        if isinstance(client, OpenAIHTTPClient):
+            return AssistantTurn(
+                client.respond(
+                    request.text,
+                    request.history,
+                    request.memory_context,
+                )
+            )
+        # Tests and future adapters may inject a small client with the legacy
+        # two-argument response method.  Preserve that seam during migration.
+        reply = client.respond(  # type: ignore[attr-defined]
+            request.text,
+            request.history,
+        )
+        return AssistantTurn(reply)
+
+    def _transcribe_with_client(
+        self,
+        audio: bytes,
+        mime: str,
+        suffix: str,
+    ) -> str:
+        client = self.client
+        if client is None:
+            raise RuntimeError("The selected brain has no transcription client.")
+        return client.transcribe(audio, mime, suffix)
+
+    def _synthesize_with_client(self, text: str) -> bytes:
+        client = self.client
+        if client is None:
+            raise RuntimeError("The selected brain has no speech client.")
+        return client.synthesize(text)  # type: ignore[attr-defined]
 
     def _result(
         self,
@@ -1168,7 +1265,10 @@ class VoicePipeline:
                 "id": record.id,
                 "kind": record.kind,
                 "summary": record.summary,
-                "sensitive": record.sensitive,
+                "sensitive": (
+                    record.sensitive
+                    or self._memory_is_sensitive(record.summary)
+                ),
                 "created_at": record.created_at,
                 "updated_at": record.updated_at,
             }
@@ -1209,7 +1309,14 @@ class VoicePipeline:
                 )
             except (MemoryStoreError, MemoryValidationError) as exc:
                 raise ClientInputError("无法读取本地长期记忆，请稍后重试。") from exc
-            records = [record for record in all_records if not record.sensitive]
+            records = [
+                record
+                for record in all_records
+                if not (
+                    record.sensitive
+                    or self._memory_is_sensitive(record.summary)
+                )
+            ]
             sensitive_count = len(all_records) - len(records)
             if not all_records:
                 reply = "我还没有保存任何长期记忆。你可以对我说：记住我喜欢爵士乐。"
@@ -1273,18 +1380,58 @@ class VoicePipeline:
                     reply = "我没有找到与“%s”相关的长期记忆。" % query
                     changed = False
                 elif len(matches) > 1:
-                    preview = "；".join(item.summary for item in matches[:5])
-                    reply = (
-                        "找到了多条相关记忆：%s。为避免误删，请在页面里选择具体的一条。"
-                        % preview
+                    private_count = sum(
+                        1
+                        for item in matches
+                        if item.sensitive
+                        or self._memory_is_sensitive(item.summary)
                     )
+                    if private_count:
+                        reply = (
+                            "找到了%d条相关记忆，其中%d条属于仅本机私密记忆。"
+                            "为避免泄露或误删，请在页面里选择具体的一条。"
+                            % (len(matches), private_count)
+                        )
+                    else:
+                        preview = "；".join(item.summary for item in matches[:5])
+                        reply = (
+                            "找到了多条相关记忆：%s。"
+                            "为避免误删，请在页面里选择具体的一条。"
+                            % preview
+                        )
                     changed = False
                 else:
+                    match = matches[0]
                     query_key = self._memory_match_key(query)
-                    summary_key = self._memory_match_key(matches[0].summary)
-                    if len(query_key) >= 2 and query_key in summary_key:
-                        self.memories.delete(matches[0].id)
-                        reply = "好的，我已经忘记：%s。" % matches[0].summary
+                    summary_key = self._memory_match_key(match.summary)
+                    generic_query = query_key in {
+                        "我",
+                        "我的",
+                        "本人",
+                        "自己",
+                        "记忆",
+                        "内容",
+                        "信息",
+                        "这个",
+                        "那个",
+                    }
+                    private = (
+                        match.sensitive
+                        or self._memory_is_sensitive(match.summary)
+                    )
+                    if private:
+                        reply = (
+                            "我找到了一条仅本机私密记忆。为避免泄露或误删，"
+                            "请在页面里点击这条记忆旁边的“忘记”。"
+                        )
+                        changed = False
+                    elif (
+                        len(query_key) >= 3
+                        and not generic_query
+                        and query_key in summary_key
+                    ):
+                        self.memories.delete(match.id)
+                        reply = "好的，我已经忘记：%s。" % match.summary
                         changed = True
                     else:
                         reply = (
@@ -1332,20 +1479,7 @@ class VoicePipeline:
     def _memory_is_sensitive(summary: str) -> bool:
         """Keep common private facts local even when the user saves them."""
 
-        patterns = (
-            r"(?:api[ _-]?key|access[ _-]?token|password|passcode|token|"
-            r"secret|密钥|密码|验证码|口令|令牌)",
-            r"(?:手机号|电话号码|联系电话|联系方式|phone|mobile)",
-            r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
-            r"(?:身份证|护照|社会保障号|社保号|驾照|证件号)",
-            r"(?:住在|家在|所在地|家庭住址|详细地址|门牌号|小区|公寓|"
-            r"\d+号|\d+室|银行卡|信用卡|银行账号)",
-            r"(?:收入|工资|资产|负债|病史|诊断|过敏|正在服用|处方|血型)",
-            r"(?:health|medical|bank account|credit card|home address)",
-            r"\b(?:\+?86[- ]?)?1[3-9]\d{9}\b",
-            r"\b\d{17}[0-9Xx]\b",
-        )
-        return any(re.search(pattern, summary, re.IGNORECASE) for pattern in patterns)
+        return is_sensitive_memory_text(summary)
 
     @staticmethod
     def _mock_reply(text: str) -> str:

@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Union
 
+from privacy_guard import contains_credential, is_sensitive_memory_text
+
 
 SCHEMA_VERSION = 1
 DEFAULT_USER_ID = "local-owner"
@@ -38,20 +40,10 @@ VALID_KINDS = {
     "event",
     "other",
 }
+CLOUD_CONTEXT_KINDS = frozenset({"preference"})
 
 _WHITESPACE_RE = re.compile(r"\s+")
 _SEARCH_SEGMENT_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+|[a-z0-9]+")
-_SECRET_PATTERNS = (
-    re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b", re.IGNORECASE),
-    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{12,}", re.IGNORECASE),
-    re.compile(
-        r"(?:api[ _-]?key|access[ _-]?token|auth(?:orization)?|password|"
-        r"passcode|verification[ _-]?code|otp|token|secret|密钥|密码|"
-        r"验证码|口令|令牌)\s*(?::|=|：|是|为|\bis\b)\s*"
-        r"[^\s,，;；]{4,}",
-        re.IGNORECASE,
-    ),
-)
 
 
 class MemoryStoreError(RuntimeError):
@@ -126,7 +118,25 @@ def _normalise(value: str) -> str:
 
 
 def _contains_secret(value: str) -> bool:
-    return any(pattern.search(value) for pattern in _SECRET_PATTERNS)
+    return contains_credential(value)
+
+
+def is_cloud_eligible_memory(record: MemoryRecord) -> bool:
+    """Allow only explicitly safe categories into a remote brain prompt."""
+
+    if record.sensitive or record.kind not in CLOUD_CONTEXT_KINDS:
+        return False
+    combined = " ".join(
+        item
+        for item in (
+            record.summary,
+            record.subject,
+            record.predicate,
+            record.value,
+        )
+        if item
+    )
+    return not is_sensitive_memory_text(combined)
 
 
 def _search_tokens(query: str) -> List[str]:
@@ -315,7 +325,10 @@ class MemoryStore:
             if item
         )
         if _contains_secret(combined):
-            raise MemoryValidationError("为了安全，长期记忆不能保存 API Key、密码或令牌。")
+            raise MemoryValidationError(
+                "为了安全，长期记忆不能保存 API Key、密码、PIN、"
+                "令牌、私钥或账户恢复凭据。"
+            )
         try:
             clean_confidence = float(confidence)
         except (TypeError, ValueError) as exc:
@@ -502,7 +515,7 @@ class MemoryStore:
         max_chars: int = 1_200,
         include_sensitive: bool = False,
     ) -> List[MemoryRecord]:
-        """Return relevant records bounded for safe inclusion in a cloud prompt."""
+        """Return current-rule, allow-listed records for a cloud prompt."""
 
         if max_chars < 1 or max_chars > MAX_CONTEXT_CHARS:
             raise MemoryValidationError(
@@ -510,11 +523,16 @@ class MemoryStore:
             )
         selected: List[MemoryRecord] = []
         used = 0
+        search_limit = limit if include_sensitive else min(100, max(limit * 10, limit))
         for record in self.search(
             query,
-            limit=limit,
-            include_sensitive=include_sensitive,
+            limit=search_limit,
+            # Re-evaluate every candidate below. This catches historical rows
+            # that an older release persisted with sensitive=0.
+            include_sensitive=True,
         ):
+            if not include_sensitive and not is_cloud_eligible_memory(record):
+                continue
             size = len(record.summary)
             if selected and used + size > max_chars:
                 continue
@@ -522,6 +540,8 @@ class MemoryStore:
                 continue
             selected.append(record)
             used += size
+            if len(selected) >= limit:
+                break
         return selected
 
     @staticmethod

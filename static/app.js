@@ -499,7 +499,11 @@ function prepareClientActions(rawActions) {
     }
     if (type === "music.play") {
       const requestedId = typeof action.station_id === "string" ? action.station_id : "";
-      const stationId = requestedId || elements.stationSelect.value;
+      if (!requestedId) {
+        showMusicError("播放指令缺少白名单电台，已拒绝播放。");
+        continue;
+      }
+      const stationId = requestedId;
       if (!musicPlayer.hasStation(stationId)) {
         showMusicError("模型请求的电台不在本地白名单中，已拒绝播放。");
         continue;

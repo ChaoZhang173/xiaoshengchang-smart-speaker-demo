@@ -23,6 +23,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from privacy_guard import canonicalize_privacy_text, contains_credential
+
 
 MAX_TOOL_ARGUMENT_CHARS = 2_000
 MAX_TOOL_RESPONSE_BYTES = 256 * 1024
@@ -32,6 +34,147 @@ SEARCH_TIMEOUT_SECONDS = 10
 SEARCH_CACHE_SECONDS = 5 * 60
 MAX_SEARCH_QUERY_CHARS = 200
 MAX_SEARCH_RESULTS = 3
+
+# A weather shorthand has no delimiter that can prove where a place ends.
+# Keep every automatically exported location in a local, conservative set.
+# This intentionally prefers asking the user to rephrase over sending an
+# arbitrary sentence fragment to the geocoder.
+COMMON_BARE_WEATHER_PLACES = frozenset(
+    {
+        "北京",
+        "上海",
+        "天津",
+        "重庆",
+        "广州",
+        "深圳",
+        "杭州",
+        "南京",
+        "苏州",
+        "成都",
+        "武汉",
+        "西安",
+        "长沙",
+        "郑州",
+        "青岛",
+        "厦门",
+        "福州",
+        "济南",
+        "沈阳",
+        "大连",
+        "哈尔滨",
+        "长春",
+        "石家庄",
+        "太原",
+        "合肥",
+        "南昌",
+        "昆明",
+        "贵阳",
+        "南宁",
+        "海口",
+        "兰州",
+        "西宁",
+        "银川",
+        "乌鲁木齐",
+        "拉萨",
+        "呼和浩特",
+        "香港",
+        "澳门",
+        "台北",
+        "和田",
+        "共和县",
+        "海淀区",
+        "浦东新区",
+    }
+)
+COMMON_ENGLISH_WEATHER_PLACES = frozenset(
+    {
+        "amsterdam",
+        "bangkok",
+        "barcelona",
+        "beijing",
+        "berlin",
+        "brussels",
+        "delhi",
+        "dubai",
+        "frankfurt",
+        "geneva",
+        "hong kong",
+        "kyoto",
+        "london",
+        "los angeles",
+        "madrid",
+        "melbourne",
+        "milan",
+        "mumbai",
+        "munich",
+        "new york",
+        "osaka",
+        "paris",
+        "paris, france",
+        "rome",
+        "san francisco",
+        "seoul",
+        "shanghai",
+        "singapore",
+        "sydney",
+        "taipei",
+        "tokyo",
+        "toronto",
+        "vancouver",
+        "vienna",
+        "zurich",
+    }
+)
+
+SAFE_IMPLICIT_NEWS_TOPICS = frozenset(
+    {
+        "",
+        "科技",
+        "财经",
+        "国际",
+        "国内",
+        "体育",
+        "娱乐",
+        "社会",
+        "本地",
+        "商业",
+        "金融",
+        "人工智能",
+        "ai",
+        "openai",
+        "technology",
+        "tech",
+        "business",
+        "finance",
+        "financial",
+        "world",
+        "international",
+        "local",
+        "sports",
+        "entertainment",
+        "science",
+        "artificial intelligence",
+    }
+)
+
+SAFE_IMPLICIT_DATA_TOPICS = frozenset(
+    {
+        "黄金",
+        "美元",
+        "人民币",
+        "欧元",
+        "日元",
+        "比特币",
+        "btc",
+        "以太坊",
+        "eth",
+        "a股",
+        "港股",
+        "美股",
+        "上证指数",
+        "纳斯达克",
+    }
+)
 
 
 RADIO_STATIONS = (
@@ -113,7 +256,7 @@ class _BingRedirectHandler(HTTPRedirectHandler):
             newurl,
             headers={
                 "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
-                "User-Agent": "xiaoshengchang-smart-speaker/0.3",
+                "User-Agent": "xiaoshengchang-smart-speaker/0.4",
             },
             method="GET",
         )
@@ -363,7 +506,7 @@ class WeatherClient:
             url,
             headers={
                 "Accept": "application/json",
-                "User-Agent": "xiaoshengchang-smart-speaker/0.3",
+                "User-Agent": "xiaoshengchang-smart-speaker/0.4",
             },
             method="GET",
         )
@@ -456,7 +599,7 @@ class BingRssSearchClient:
             url,
             headers={
                 "Accept": "application/rss+xml, application/xml;q=0.9, text/xml;q=0.8",
-                "User-Agent": "xiaoshengchang-smart-speaker/0.3",
+                "User-Agent": "xiaoshengchang-smart-speaker/0.4",
             },
             method="GET",
         )
@@ -781,22 +924,25 @@ class ToolRouter:
             return None
         if re.search(r"(现在)?(几点|什么时间|当前时间|日期|星期几)", text):
             return self.execute("get_local_time", {})
-        explicit_search = self._search_query(text, explicit_only=True)
-        if explicit_search:
+        intent = self.authorized_intent(text)
+        if intent is None:
+            return None
+        name = str(intent["tool_name"])
+        arguments = dict(intent["arguments"])
+        if name == "web_search":
             return self._network_tool(
                 "web_search",
-                {"query": explicit_search},
+                arguments,
                 allow_network=allow_network,
                 offline_message=(
                     "联网搜索会把关键词发送给 Bing；请先配置真实联网模式。"
                 ),
             )
-        weather_intent = self.weather_intent(text)
-        if weather_intent is not None:
+        if name == "get_weather":
             guard = self.weather_guard(text)
             if guard is not None:
                 return guard
-            city = str(weather_intent.get("city", "")).strip()
+            city = str(arguments.get("city", "")).strip()
             if city:
                 return self._network_tool(
                     "get_weather",
@@ -806,27 +952,133 @@ class ToolRouter:
                         "天气查询会把城市名发送给 Open-Meteo；请先配置真实联网模式。"
                     ),
                 )
-        search_query = self._search_query(text, explicit_only=False)
+        if name in {
+            "play_radio",
+            "pause_music",
+            "resume_music",
+            "stop_music",
+            "set_music_volume",
+        }:
+            return self.execute(name, arguments)
+        return None
+
+    def authorized_intent(self, text_value: Any) -> Optional[Dict[str, Any]]:
+        """Return the single host-authorized tool and canonical arguments.
+
+        The ordering is deliberate.  A model cannot reinterpret an explicit
+        web-search command as a weather request, nor turn an ambiguous generic
+        weather phrase into a search request for a different destination.
+        """
+
+        text = " ".join(str(text_value or "").strip().split())
+        if not text or self.has_negated_action(text):
+            return None
+        explicit_search = self._search_query(text, explicit_only=True)
+        if explicit_search:
+            return {
+                "tool_name": "web_search",
+                "arguments": {
+                    "query": explicit_search[:MAX_SEARCH_QUERY_CHARS].rstrip()
+                },
+            }
+        weather = self.weather_intent(text)
+        if weather is not None:
+            return {
+                "tool_name": "get_weather",
+                "arguments": {"city": str(weather.get("city", "")).strip()},
+            }
+        search_query = self.search_query_for_text(text)
         if search_query:
-            return self._network_tool(
-                "web_search",
-                {"query": search_query},
-                allow_network=allow_network,
-                offline_message=(
-                    "联网搜索会把关键词发送给 Bing；请先配置真实联网模式。"
-                ),
+            return {
+                "tool_name": "web_search",
+                "arguments": {"query": search_query},
+            }
+        return self.music_intent(text)
+
+    def music_intent(self, text_value: Any) -> Optional[Dict[str, Any]]:
+        """Return the one music action explicitly authorized by current text."""
+
+        text = " ".join(str(text_value or "").strip().split())
+        lowered = text.casefold()
+        if (
+            not text
+            or self.has_negated_action(lowered)
+            or self._has_meta_action_context(text)
+        ):
+            return None
+
+        # Device actions require a complete command-shaped utterance.  A bare
+        # substring check is unsafe here: quoted examples, capability
+        # questions, and reported speech can all contain words such as
+        # "播放音乐" without authorizing playback.
+        working = text.strip(" \t\r\n，,。！？?!：:；;")
+        polite = (
+            r"(?:请(?:你)?|麻烦(?:你)?|帮我|给我|替我|"
+            r"能不能(?:帮我)?|你能不能|可以(?:帮我)?|请帮我)?"
+        )
+        suffix = r"(?:一下|吧|好吗|可以吗|谢谢)?"
+
+        if re.fullmatch(
+            polite
+            + r"\s*(?:停止(?:播放)?音乐|关闭音乐|"
+            r"(?:把|将)\s*音乐\s*(?:停止|关闭|关掉))\s*"
+            + suffix,
+            working,
+        ) or re.fullmatch(
+            r"(?:please\s+)?stop\s+music(?:\s+please)?", working.casefold()
+        ):
+            return {"tool_name": "stop_music", "arguments": {}}
+        if re.fullmatch(
+            polite
+            + r"\s*(?:暂停(?:一下)?(?:音乐|播放)|"
+            r"(?:把|将)\s*音乐\s*暂停)\s*"
+            + suffix,
+            working,
+        ) or re.fullmatch(
+            r"(?:please\s+)?pause\s+music(?:\s+please)?", working.casefold()
+        ):
+            return {"tool_name": "pause_music", "arguments": {}}
+        if re.fullmatch(
+            polite
+            + r"\s*(?:继续(?:音乐|播放(?:音乐)?)|恢复播放(?:音乐)?)\s*"
+            + suffix,
+            working,
+        ) or re.fullmatch(
+            r"(?:please\s+)?resume\s+music(?:\s+please)?", working.casefold()
+        ):
+            return {"tool_name": "resume_music", "arguments": {}}
+        volume_match = re.fullmatch(
+            polite
+            + r"\s*(?:把|将)?\s*(?:音乐(?:的)?\s*)?音量\s*"
+            r"(?:调(?:整)?(?:到|成)|设置(?:为|成)|设为)\s*"
+            r"(\d{1,3})\s*(?:%|％|百分比?)?\s*"
+            + suffix,
+            working,
+        )
+        if not volume_match:
+            volume_match = re.fullmatch(
+                r"(?:please\s+)?set\s+(?:the\s+)?(?:music\s+)?volume\s+to\s+"
+                r"(\d{1,3})(?:\s*%|\s+percent)?(?:\s+please)?",
+                working.casefold(),
             )
-        if any(phrase in lowered for phrase in ("停止音乐", "关闭音乐", "stop music")):
-            return self.execute("stop_music", {})
-        if any(phrase in lowered for phrase in ("暂停音乐", "暂停播放", "pause music")):
-            return self.execute("pause_music", {})
-        if any(phrase in lowered for phrase in ("继续音乐", "继续播放", "resume music")):
-            return self.execute("resume_music", {})
-        volume_match = re.search(r"(?:音乐)?音量(?:调到|设置为|设为)?\s*(\d{1,3})", text)
         if volume_match:
-            return self.execute("set_music_volume", {"volume": int(volume_match.group(1))})
-        if any(phrase in lowered for phrase in ("播放音乐", "放点音乐", "播放电台", "play music")):
-            return self.execute("play_radio", {"station_id": next(iter(self.station_by_id))})
+            return {
+                "tool_name": "set_music_volume",
+                "arguments": {"volume": int(volume_match.group(1))},
+            }
+        if re.fullmatch(
+            polite
+            + r"\s*(?:开始\s*)?(?:播放(?:一下)?(?:音乐|电台)|"
+            r"放(?:点|一下)?音乐|来点音乐)\s*"
+            + suffix,
+            working,
+        ) or re.fullmatch(
+            r"(?:please\s+)?play\s+music(?:\s+please)?", working.casefold()
+        ):
+            return {
+                "tool_name": "play_radio",
+                "arguments": {"station_id": next(iter(self.station_by_id))},
+            }
         return None
 
     def _network_tool(
@@ -884,6 +1136,14 @@ class ToolRouter:
     def weather_intent(cls, text_value: Any) -> Optional[Dict[str, Any]]:
         text = " ".join(str(text_value or "").strip().split())
         lowered = text.casefold()
+        if (
+            not text
+            or cls.has_negated_action(text)
+            or cls._has_meta_action_context(text)
+            or cls._contains_sensitive_personal_data(text)
+            or bool(cls._search_query(text, explicit_only=True))
+        ):
+            return None
         future = bool(
             re.search(
                 r"(?:昨天|(?<!当)前天|历史|明天|后天|未来|上周|本周|这周|下周|"
@@ -896,47 +1156,102 @@ class ToolRouter:
             )
         )
         if "天气" in text:
-            prefix = text.split("天气", 1)[0].strip(" ，,。！？?!：:")
-            prefix = cls._strip_weather_request_prefix(prefix)
-            prefix = re.sub(
-                r"^(?:今天|今日|现在|当前|此刻|这会儿|实时|最新)\s*", "", prefix
+            working = text.strip(" \t\r\n，,。！？?!：:；;")
+            stripped_working = cls._strip_weather_request_prefix(working)
+            chinese_match = re.fullmatch(
+                r"(?P<body>.*?)天气\s*"
+                r"(?:怎么样|怎样|如何|情况(?:怎么样)?|好吗|呢)?",
+                stripped_working,
             )
-            previous = None
-            while prefix != previous:
-                previous = prefix
-                prefix = re.sub(r"(?:的)\s*$", "", prefix).strip()
-                prefix = re.sub(
-                    r"(?:今天|今日|现在|当前|此刻|这会儿|实时|最新)\s*$",
-                    "",
-                    prefix,
-                ).strip()
-            if prefix in {"", "当地", "这里", "这边", "那边"}:
-                prefix = ""
-            multiple = cls._has_multiple_places(prefix)
-            return {"city": prefix, "future": future, "multiple": multiple}
+            if not chinese_match:
+                return None
+            city = cls._strip_weather_time_words(chinese_match.group("body"))
+            if city in {"当地", "这里", "这边", "那边"}:
+                city = ""
+            multiple = cls._has_multiple_places(city)
+            if not multiple and not cls._valid_weather_city(city):
+                return None
+            return {"city": city, "future": future, "multiple": multiple}
 
-        english_match = re.search(
-            r"\bweather\s+(?:in|for)\s+(.+?)(?:[?.!]|$)", lowered,
+        english_working = lowered.strip(" \t\r\n,.?!:;")
+        english_match = re.fullmatch(
+            r"(?:(?:please\s+)?(?:what(?:'s|\s+is)\s+|check\s+|show\s+|"
+            r"tell\s+me\s+)?(?:the\s+)?)weather\s+(?:in|for)\s+(.+)",
+            english_working,
             re.IGNORECASE,
         )
         if not english_match:
-            english_match = re.search(
-                r"(?:^|\b)([a-z][a-z .,'-]{1,80}?)\s+weather(?:[?.!]|$)",
-                text,
+            english_match = re.fullmatch(
+                r"(?:(?:please\s+)?(?:check\s+|show\s+|tell\s+me\s+)?)"
+                r"([a-z][a-z .,'-]{1,80}?)\s+(?:current\s+)?weather"
+                r"(?:\s+(?:now|today))?",
+                english_working,
                 re.IGNORECASE,
             )
         if english_match:
             city = english_match.group(1).strip(" ,.?！!")
             city = re.sub(
-                r"^(?:what(?:'s| is)?|check|tell me|please)\s+", "", city,
-                flags=re.IGNORECASE,
+                r"\s+(?:now|today|yesterday|tomorrow)$", "", city
             ).strip()
+            multiple = bool(re.search(r"\b(?:and|or)\b|/", city, re.IGNORECASE))
+            if not multiple and not cls._valid_weather_city(city):
+                return None
             return {
                 "city": city,
                 "future": future,
-                "multiple": bool(re.search(r"\b(?:and|or)\b|/", city, re.IGNORECASE)),
+                "multiple": multiple,
             }
         return None
+
+    @staticmethod
+    def _strip_weather_time_words(value: str) -> str:
+        text = value.strip()
+        time_word = (
+            r"(?:今天|今日|现在|当前|此刻|这会儿|实时|最新|昨天|前天|明天|"
+            r"后天|未来|上周|本周|这周|下周(?:[一二三四五六日天])?|周末|"
+            r"星期[一二三四五六日天])"
+        )
+        previous = None
+        while text != previous:
+            previous = text
+            text = re.sub(r"^(?:" + time_word + r")\s*", "", text).strip()
+            text = re.sub(r"(?:的)\s*$", "", text).strip()
+            text = re.sub(r"(?:" + time_word + r")\s*$", "", text).strip()
+        return text
+
+    @classmethod
+    def _valid_weather_city(
+        cls,
+        value: str,
+    ) -> bool:
+        city = value.strip()
+        if not city:
+            return True
+        if len(city) < 2 or len(city) > 80:
+            return False
+        if cls._contains_sensitive_personal_data(city):
+            return False
+        if not re.fullmatch(
+            r"[\u3400-\u9fffA-Za-zÀ-ÖØ-öø-ÿ .,'’·，、/-]+", city
+        ):
+            return False
+        if re.search(
+            r"(?:解释|说明|定义|翻译|复述|转述|引用|举例|原样|怎么|如何|"
+            r"为什么|是否|会不会|你会|这个词|这句话|这几个字|我的|"
+            r"别人说|有人说|请|查询|搜索|联网|上网|查找|搜一下|住在|"
+            r"患有|诊断|工资|收入|怀孕|癌症|顺便|然后|另外|同时|附近|"
+            r"(?:我|你|他|她|它|本人|自己)(?:在|有|想|要|说|听|看|得|患|的|家))",
+            city,
+            re.IGNORECASE,
+        ):
+            return False
+        if city.casefold() in COMMON_ENGLISH_WEATHER_PLACES:
+            return True
+        if city in COMMON_BARE_WEATHER_PLACES:
+            return True
+        if city.endswith("市") and city[:-1] in COMMON_BARE_WEATHER_PLACES:
+            return True
+        return False
 
     @staticmethod
     def _has_multiple_places(value: str) -> bool:
@@ -965,6 +1280,13 @@ class ToolRouter:
     @classmethod
     def _search_query(cls, text_value: Any, *, explicit_only: bool) -> str:
         text = " ".join(str(text_value or "").strip().split())
+        if (
+            not text
+            or cls.has_negated_action(text)
+            or cls._has_meta_action_context(text)
+            or cls._has_unsafe_search_continuation(text)
+        ):
+            return ""
         working = text.strip(" ，,。！？?!：:")
         polite = re.compile(
             r"^(?:请问|麻烦(?:你)?|请(?:你)?|你能不能|能不能|可以(?:请)?|"
@@ -981,22 +1303,23 @@ class ToolRouter:
             r"^(?:search(?:\s+the\s+web)?(?:\s+for)?|look\s+up|google)\s+(.+)$",
         )
         for pattern in patterns:
-            matched = re.match(pattern, working, re.IGNORECASE)
+            matched = re.fullmatch(pattern, working, re.IGNORECASE)
             if matched:
-                return matched.group(1).strip(" ，,。！？?!：:")
+                query = matched.group(1).strip(" ，,。！？?!：:")
+                return query if cls._valid_explicit_search_query(query) else ""
         if explicit_only:
             return ""
-        generic = re.match(r"^(?:查一下|查查|查询一下)\s*(.+)$", working)
+        # A generic "查一下" weather request belongs to the weather tool even
+        # if a model proposes web_search directly.
+        if cls.weather_intent(text) is not None:
+            return ""
+        generic = re.fullmatch(r"(?:查一下|查查|查询一下)\s*(.+)", working)
         if generic:
-            return generic.group(1).strip(" ，,。！？?!：:")
-        if re.search(
-            r"(?:最新|实时|刚刚|今日新闻|今天.*(?:新闻|消息)|近期.*(?:变化|消息)|"
-            r"\b(?:latest|breaking|today'?s?\s+news|recent\s+news)\b)",
-            working,
-            re.IGNORECASE,
-        ):
-            return re.sub(r"^(?:告诉我|介绍一下)\s*", "", working).strip()
-        return ""
+            query = generic.group(1).strip(" ，,。！？?!：:")
+            return query if cls._valid_explicit_search_query(query) else ""
+        if re.search(r"(?:不是|并非|不算).{0,12}(?:最新|实时|新闻|消息)", text):
+            return ""
+        return cls._implicit_search_query(working)
 
     @classmethod
     def search_query_for_text(cls, text_value: Any) -> str:
@@ -1004,15 +1327,342 @@ class ToolRouter:
         return query[:MAX_SEARCH_QUERY_CHARS].rstrip()
 
     @staticmethod
-    def has_negated_action(text_value: Any) -> bool:
-        text = " ".join(str(text_value or "").strip().split()).casefold()
+    def _is_implicit_search_request(text_value: Any) -> bool:
+        text = " ".join(str(text_value or "").strip().split()).strip(
+            " ，,。！？?!：:"
+        )
+        lowered = text.casefold()
+        if re.match(
+            r"^(?:请(?:你)?|麻烦(?:你)?|帮我|给我|替我)?\s*"
+            r"(?:告诉我|介绍一下|看看|查查|查一下|查询一下|我想知道|想知道)",
+            text,
+        ):
+            return True
+        if re.match(
+            r"^(?:今天|今日|最近|近期|现在|当前|刚刚|最新|实时)"
+            r"[^。！？!?]{0,160}(?:有什么|有哪些|发生了什么|是什么|怎么样|"
+            r"如何|多少|谁|何时|哪(?:些|个|条|一))",
+            text,
+        ):
+            return True
+        if re.match(
+            r"^(?:what|which|who|when|how|today|latest|recent|breaking)\b",
+            lowered,
+        ):
+            return True
+        return False
+
+    @classmethod
+    def _implicit_search_query(cls, text_value: Any) -> str:
+        """Extract one request clause instead of exporting the whole turn."""
+
+        text = " ".join(str(text_value or "").strip().split()).strip(
+            " ，,。！？?!：:；;"
+        )
+        freshness = re.compile(
+            r"(?:最新|实时|刚刚|今日新闻|今天.*(?:新闻|消息)|"
+            r"近期.*(?:变化|消息)|最近.*(?:新闻|消息|变化)|"
+            r"\b(?:latest|breaking|today'?s?\s+news|recent\s+news)\b)",
+            re.IGNORECASE,
+        )
+        # Prefer the smallest standalone clause that still expresses the
+        # request.  This prevents unrelated health, finance, address, or other
+        # conversational context in an earlier clause from becoming a query.
+        clauses = [
+            item.strip()
+            for item in re.split(r"[，,。；;！？!?]+", text)
+            if item.strip()
+        ]
+        # Only the final clause can authorize an implicit network request.
+        # This still permits "private context, safe current question" while a
+        # later cancellation or unrelated clause always wins.
+        candidates = clauses[-1:]
+        for candidate in candidates:
+            if not freshness.search(candidate):
+                continue
+            if not cls._is_implicit_search_request(candidate):
+                continue
+            query = re.sub(
+                r"^(?:请(?:你)?|麻烦(?:你)?|帮我|给我|替我)?\s*"
+                r"(?:告诉我|介绍一下)\s*",
+                "",
+                candidate,
+            ).strip()
+            if (
+                len(query) < 2
+                or cls._contains_sensitive_personal_data(query)
+                or cls._has_meta_action_context(query)
+                or not cls._valid_implicit_search_query(query)
+            ):
+                continue
+            return query
+        return ""
+
+    @classmethod
+    def _valid_explicit_search_query(cls, text_value: Any) -> bool:
+        query = " ".join(str(text_value or "").strip().split())
+        if len(query) < 2 or len(query) > MAX_SEARCH_QUERY_CHARS:
+            return False
+        if any(ord(char) < 32 for char in query):
+            return False
+        canonical_query = canonicalize_privacy_text(query)
+        if len(canonical_query) < 2 or len(canonical_query) > MAX_SEARCH_QUERY_CHARS:
+            return False
+        if re.search(r"[，,。！？!?；;]", query):
+            return False
+        if re.search(
+            r"(?:我|本人|我们|我的|我们的|自我)|"
+            r"\b(?:i|me|my|mine|we|us|our|ours)\b",
+            canonical_query,
+            re.IGNORECASE,
+        ):
+            return False
+        return not (
+            cls._contains_sensitive_personal_data(query)
+            or cls._has_meta_action_context(query)
+            or cls._has_unsafe_search_continuation(query)
+        )
+
+    @staticmethod
+    def _valid_implicit_search_query(text_value: Any) -> bool:
+        query = " ".join(str(text_value or "").strip().split()).strip(
+            " ，,。！？?!：:；;"
+        )
+        if len(query) < 2 or len(query) > 160:
+            return False
+        news_match = re.fullmatch(
+            r"(?:今天|今日|最近|近期|现在|当前|刚刚)?\s*"
+            r"(?:有)?(?:什么|哪些)\s*(?:最新|实时|近期|最近)?\s*"
+            r"(?P<topic>[\u3400-\u9fffA-Za-z ]{0,20}?)\s*"
+            r"(?:新闻|消息|动态|进展)(?:吗|呢)?",
+            query,
+            re.IGNORECASE,
+        )
+        if news_match:
+            topic = " ".join(news_match.group("topic").split()).casefold()
+            return topic in SAFE_IMPLICIT_NEWS_TOPICS
+
+        data_match = re.fullmatch(
+            r"(?:今天|今日|最近|近期|现在|当前|刚刚|最新|实时)\s*"
+            r"(?P<topic>[\u3400-\u9fffA-Za-z ]{1,20}?)\s*"
+            r"(?:价格|金价|汇率|比分|结果|数据)"
+            r"(?:是多少|有多少|怎么样|如何|吗|呢)",
+            query,
+            re.IGNORECASE,
+        )
+        if data_match:
+            topic = " ".join(data_match.group("topic").split()).casefold()
+            return topic in SAFE_IMPLICIT_DATA_TOPICS
+
+        english_news = re.fullmatch(
+            r"(?:(?:what|which)\s+(?:is|are)\s+(?:the\s+)?)?"
+            r"(?:latest|recent|breaking|today'?s?)\s*"
+            r"(?P<topic>[a-z ]{0,30}?)\s*"
+            r"(?:news|updates?|developments?)(?:\s+(?:today|now))?",
+            query,
+            re.IGNORECASE,
+        )
+        if not english_news:
+            return False
+        topic = " ".join(english_news.group("topic").split()).casefold()
+        return topic in SAFE_IMPLICIT_NEWS_TOPICS
+
+    @staticmethod
+    def _has_unsafe_search_continuation(text_value: Any) -> bool:
+        text = canonicalize_privacy_text(str(text_value or ""))
         return bool(
             re.search(
-                r"(?:不要|别|不想|无需|不用|不需要|不\s*|禁止|不是(?:要)?|"
-                r"don't|do\s+not|never)\s*(?:再\s*)?"
-                r"(?:(?:请|你|给我|帮我|替我|去|进行|please|for\s+me)\s*){0,3}"
-                r"(?:播放|放|暂停|继续|停止|打开|关闭|查询|查|看看|告诉我|搜索|搜|联网|上网|"
-                r"调整|调|设置|set|play|pause|resume|stop|check)",
+                r"(?:然后|接着|顺便|另外|同时|随后)"
+                r"\s*(?:再)?(?:帮我|替我|给我)?\s*"
+                r"(?:记住|保存|发送|转发|下单|购买|删除|执行|打开|关闭|搜索|查询)",
+                text,
+            )
+            or re.search(
+                r"(?:\band\s+then\b|\bthen\b|\balso\b|\bafter\s+that\b|\bnext\b)"
+                r".{0,24}\b(?:remember|save|send|forward|order|purchase|buy|"
+                r"delete|execute|open|close|search|look\s+up)\b",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"(?:算了(?:吧|呀|啊)?|不(?:用|需要)了(?:吧)?|"
+                r"不用(?=\s*(?:谢谢|[，,。；;！？!?]|$))|"
+                r"不需要(?=\s*(?:谢谢|[，,。；;！？!?]|$))|"
+                r"不要了(?:吧)?|别弄了(?:吧)?|别管了(?:吧)?|"
+                r"取消(?:这次|搜索|操作|它|那个|吧|了)|"
+                r"取消(?=\s*(?:谢谢|[，,。；;！？!?]|$))|"
+                r"(?:我)?不想(?:看|查|搜|要|弄)(?:了)?|"
+                r"(?:我)?(?:已经)?改变主意(?:了)?|(?:先)?停一下|"
+                r"(?:^|[\s，,。；;！？!?])(?:撤销|撤回|作废|作罢|"
+                r"(?:终止|中止)(?:这次|本次)?|放弃(?:这次|本次)?)"
+                r"(?:搜索|操作|请求|指令|它|那个)?(?:吧|了|一下)?(?:谢谢)?$|"
+                r"不要(?:真的)?(?:搜索|执行|做|弄)|"
+                r"别(?:真的)?(?:搜索|执行|做|弄)|"
+                r"不是(?:我|我的)?(?:指令|命令|请求)|"
+                r"并非(?:我|我的)?(?:指令|命令|请求)|"
+                r"(?:这|那)?(?:只是|仅仅是)(?:电影|影视|剧中)?(?:台词|引用|例子)|"
+                r"(?:我|这|那)?(?:正在|只是|只是在|仅仅在)?"
+                r"(?:转述|复述|引用|举例)|"
+                r"never\s+mind|(?:i(?:'ve|\s+have)?\s+)?changed?\s+my\s+mind|"
+                r"(?:^|\s)(?:don['’]?t\s+bother|do\s+not\s+bother|"
+                r"abort|forget\s+it)(?:\s+(?:it|that|this|please))?[.!?]*$|"
+                r"(?:stop\s+(?:searching|the\s+search)|"
+                r"cancel\s+(?:the\s+)?(?:request|search)|"
+                r"scratch\s+that|disregard\s+that)"
+                r"(?:\s+please)?[.!?]*$|"
+                r"(?:hold\s+on|stop\s+(?:it|that|this))|"
+                r"\bcancel(?:\s+(?:it|that|this|please))\b|"
+                r"(?:please\s+)?(?:do\s+not|don't)\s+"
+                r"(?:do|execute|run|search)"
+                r"(?:\s+(?:it|that|this))?|"
+                r"i(?:\s+am|'m)\s+(?:only|just)\s+"
+                r"(?:quoting|repeating|reciting)|"
+                r"(?:this|that)\s+is\s+(?:only|just)\s+(?:a\s+)?"
+                r"(?:quote|example|movie\s+line)|"
+                r"(?:it\s+is|it's|this\s+is|that's)\s+not\s+my\s+"
+                r"(?:command|instruction|request))",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    @staticmethod
+    def _contains_sensitive_personal_data(text_value: Any) -> bool:
+        text = canonicalize_privacy_text(str(text_value or ""))
+        return bool(
+            contains_credential(text)
+            or re.search(
+                r"(?:我的)?(?:住址|家庭地址|地址|手机号|手机号码|电话号码|电话|"
+                r"身份证(?:号)?|邮箱|电子邮箱|密码|验证码|银行卡(?:号)?|账号|"
+                r"pin|私钥)"
+                r"\s*(?:是|为|[:：])?",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\b(?:my|our)\s+(?:password|passcode|api\s*key|token|secret|"
+                r"home\s+address|address|phone(?:\s+number)?|social\s+security|"
+                r"ssn|credit\s+card|bank\s+account|salary|income)\s*"
+                r"(?:is|was|=|:)",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\b(?:password|passcode|api\s*key|access\s+token|secret)\s*"
+                r"(?:is|=|:)\s*\S+",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\b(?:i|we)\s+(?:have|had|have\s+been|was|were|am)\s+"
+                r"(?:diagnosed\s+with\s+)?(?:cancer|depression|anxiety|"
+                r"diabetes|a\s+medical\s+condition|pregnant)\b",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"(?:我|本人|我们|这是我的|属于我的)[^，,。；;！？!?]{0,12}"
+                r"(?:秘密|隐私(?:信息)?|机密(?:信息)?|性取向|性别认同|"
+                r"宗教|信仰|民族|种族|政治(?:面貌|立场))",
+                text,
+            )
+            or re.search(
+                r"\b(?:(?:my|our)\s+(?:secret|private\s+information|"
+                r"confidential\s+information|religion|religious\s+beliefs?|"
+                r"sexual\s+orientation|gender\s+identity|ethnicity|race|"
+                r"political\s+(?:affiliation|views?))|"
+                r"i\s+am\s+(?:gay|lesbian|bisexual|transgender))\b",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"(?:我|本人|家人)[^，,。；;！？!?]{0,16}"
+                r"(?:患有|罹患|得了|确诊|怀孕|癌症|肿瘤|抑郁|焦虑症?|"
+                r"收入|工资)",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _has_meta_action_context(text_value: Any) -> bool:
+        lowered = canonicalize_privacy_text(str(text_value or ""))
+        action = (
+            r"(?:播放|放点?音乐|暂停|继续播放|恢复播放|停止|关闭音乐|音量|"
+            r"天气|查询|搜索|联网搜索|最新(?:新闻|消息)|实时(?:新闻|消息)|"
+            r"play\s+music|pause\s+music|resume\s+music|stop\s+music|"
+            r"weather|search|latest\s+news)"
+        )
+        if re.search(
+            r"^(?:如果|假如|假设|假定|要是|倘若|比如|例如|万一|"
+            r"if\b|suppose\b|for\s+example\b)",
+            lowered,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            r"(?:听见|听到|看到|日志|记录|会议记录|别人说|有人说|他说|她说|"
+            r"他们说|原话|转述|复述|引用|heard|quoted?|someone\s+said)"
+            r"[^。！？!?]{0,48}" + action,
+            lowered,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            r"(?:解释|说明|定义|翻译|讨论|分析|举例|原样复述|是什么意思|"
+            r"含义|这句话|这个词|这几个字|explain|translate|define|meaning)"
+            r"[^。！？!?]{0,48}" + action,
+            lowered,
+            re.IGNORECASE,
+        ) or re.search(
+            action
+            + r"[^。！？!?]{0,48}(?:这个词|这句话|这个命令|这几个字|"
+            r"是什么意思|含义|定义|翻译成|怎么处理|"
+            r"(?:我)?只是(?:在)?(?:转述|复述|引用|举例)|"
+            r"(?:这|那)?(?:只是|仅仅是)(?:电影|影视|剧中)?(?:台词|引用|例子)|"
+            r"不是(?:我|我的)?(?:指令|命令|请求)|"
+            r"并非(?:我|我的)?(?:指令|命令|请求)|what\s+does|mean)",
+            lowered,
+            re.IGNORECASE,
+        ) or re.search(
+            action
+            + r"[^.!?]{0,80}(?:(?:this|that)\s+is\s+(?:only|just)\s+"
+            r"(?:a\s+)?(?:quote|example|movie\s+line)|"
+            r"(?:it\s+is|it's|this\s+is|that's)\s+not\s+my\s+"
+            r"(?:command|instruction|request))",
+            lowered,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            r"^(?:怎么|如何|为什么|为何|你会|你能|你可以|系统会|音箱会)"
+            r"[^。！？!?]{0,48}" + action,
+            lowered,
+            re.IGNORECASE,
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def has_negated_action(text_value: Any) -> bool:
+        text = canonicalize_privacy_text(str(text_value or ""))
+        return bool(
+            re.search(
+                r"(?:不要|千万别|切勿|请勿|莫要|莫|别|不想|不希望|无需|不用|不需要|"
+                r"禁止|不是(?:要)?|不)\s*[^，。；！？!?]{0,32}"
+                r"(?:播放|放|暂停|继续|恢复|停止|打开|关闭|音量|查询|查|看看|"
+                r"知道|回答|告诉|搜索|搜|联网|上网|调整|调|设置|获取|了解)",
+                text,
+                re.IGNORECASE,
+            )
+            or re.search(
+                r"\b(?:don't|do\s+not|never|not|without)\b"
+                r"[^.!?]{0,64}\b(?:set|get|play|pause|resume|stop|check|search|"
+                r"look\s+up|find|tell|answer|weather)\b",
                 text,
                 re.IGNORECASE,
             )
