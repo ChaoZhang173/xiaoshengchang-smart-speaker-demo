@@ -13,6 +13,8 @@ import json
 import math
 import re
 import socket
+import subprocess
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -23,7 +25,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from privacy_guard import canonicalize_privacy_text, contains_credential
+from privacy_guard import canonicalize_privacy_text, contains_credential, is_sensitive_memory_text
+from news_feed import NewsFeedClient, NewsFeedError
 
 
 MAX_TOOL_ARGUMENT_CHARS = 2_000
@@ -34,128 +37,6 @@ SEARCH_TIMEOUT_SECONDS = 10
 SEARCH_CACHE_SECONDS = 5 * 60
 MAX_SEARCH_QUERY_CHARS = 200
 MAX_SEARCH_RESULTS = 3
-
-# A weather shorthand has no delimiter that can prove where a place ends.
-# Keep every automatically exported location in a local, conservative set.
-# This intentionally prefers asking the user to rephrase over sending an
-# arbitrary sentence fragment to the geocoder.
-COMMON_BARE_WEATHER_PLACES = frozenset(
-    {
-        "北京",
-        "上海",
-        "天津",
-        "重庆",
-        "广州",
-        "深圳",
-        "杭州",
-        "南京",
-        "苏州",
-        "成都",
-        "武汉",
-        "西安",
-        "长沙",
-        "郑州",
-        "青岛",
-        "厦门",
-        "福州",
-        "济南",
-        "沈阳",
-        "大连",
-        "哈尔滨",
-        "长春",
-        "石家庄",
-        "太原",
-        "合肥",
-        "南昌",
-        "昆明",
-        "贵阳",
-        "南宁",
-        "海口",
-        "兰州",
-        "西宁",
-        "银川",
-        "乌鲁木齐",
-        "拉萨",
-        "呼和浩特",
-        "香港",
-        "澳门",
-        "台北",
-        "和田",
-        "共和县",
-        "海淀区",
-        "浦东新区",
-    }
-)
-COMMON_ENGLISH_WEATHER_PLACES = frozenset(
-    {
-        "amsterdam",
-        "bangkok",
-        "barcelona",
-        "beijing",
-        "berlin",
-        "brussels",
-        "delhi",
-        "dubai",
-        "frankfurt",
-        "geneva",
-        "hong kong",
-        "kyoto",
-        "london",
-        "los angeles",
-        "madrid",
-        "melbourne",
-        "milan",
-        "mumbai",
-        "munich",
-        "new york",
-        "osaka",
-        "paris",
-        "paris, france",
-        "rome",
-        "san francisco",
-        "seoul",
-        "shanghai",
-        "singapore",
-        "sydney",
-        "taipei",
-        "tokyo",
-        "toronto",
-        "vancouver",
-        "vienna",
-        "zurich",
-    }
-)
-
-SAFE_IMPLICIT_NEWS_TOPICS = frozenset(
-    {
-        "",
-        "科技",
-        "财经",
-        "国际",
-        "国内",
-        "体育",
-        "娱乐",
-        "社会",
-        "本地",
-        "商业",
-        "金融",
-        "人工智能",
-        "ai",
-        "openai",
-        "technology",
-        "tech",
-        "business",
-        "finance",
-        "financial",
-        "world",
-        "international",
-        "local",
-        "sports",
-        "entertainment",
-        "science",
-        "artificial intelligence",
-    }
-)
 
 SAFE_IMPLICIT_DATA_TOPICS = frozenset(
     {
@@ -305,6 +186,7 @@ class WeatherClient:
                 return dict(cached[1])
 
         location: Optional[Dict[str, Any]] = None
+        used_romanization = False
         for geocoding_name in self._geocoding_names(city):
             geocoding = self._get_json(
                 self.GEOCODING_URL,
@@ -316,6 +198,18 @@ class WeatherClient:
                 },
             )
             results = geocoding.get("results")
+            used_romanization = bool(
+                re.fullmatch(r"[\u3400-\u9fff·]{2,30}", city)
+                and re.fullmatch(r"[a-z]+", geocoding_name)
+            )
+            if used_romanization and isinstance(results, list):
+                # Pinyin homophones must not resolve to an unrelated place
+                # merely because the geocoder returned it first.
+                results = [
+                    item for item in results if isinstance(item, dict)
+                    and str(item.get("country_code", "")).upper() in {"CN", "TW", "HK", "MO"}
+                    and self._normalized_place_name(item.get("name", "")) == geocoding_name
+                ]
             location = self._select_location(results, geocoding_name)
             if location is not None:
                 break
@@ -365,7 +259,7 @@ class WeatherClient:
         if not 0 <= humidity <= 100 or precipitation < 0 or wind < 0:
             raise ToolNetworkError("天气服务返回了超出范围的数值。")
 
-        display_parts = [str(location.get("name", city)).strip() or city]
+        display_parts = [city if used_romanization else (str(location.get("name", city)).strip() or city)]
         admin = str(location.get("admin1", "")).strip()
         country = str(location.get("country", "")).strip()
         if admin and admin not in display_parts:
@@ -404,7 +298,38 @@ class WeatherClient:
             normalized = base[:-1]
             names.append(normalized + ((", " + qualifier) if qualifier else ""))
         names.append(city)
+        # Many Chinese county-level places are indexed only in Latin script
+        # (e.g. Gaomi and Zouping). Use the Mac's local text transliterator;
+        # this is a spelling fallback, never an LLM-invented location.
+        romanized = WeatherClient._romanized_place_name(names[0])
+        if romanized:
+            names.append(romanized)
         return list(dict.fromkeys(names))
+
+    @staticmethod
+    def _romanized_place_name(city: str) -> str:
+        if sys.platform != "darwin" or not re.fullmatch(r"[\u3400-\u9fff·]{2,30}", city):
+            return ""
+        # Fixed program, input passed only as argv. Never interpolate a place
+        # into executable source or invoke a shell. No network or app control.
+        script = (
+            'ObjC.import("Foundation"); function run(argv) {'
+            'return ObjC.unwrap($(argv[0]).stringByApplyingTransformReverse('
+            '"Any-Latin; Latin-ASCII", false)); }'
+        )
+        try:
+            result = subprocess.run(
+                ["/usr/bin/osascript", "-l", "JavaScript", "-e", script, city],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        if result.returncode != 0:
+            return ""
+        spelling = result.stdout.strip()
+        if not re.fullmatch(r"[a-zA-Z ]{2,100}", spelling):
+            return ""
+        return spelling.replace(" ", "").casefold()
 
     @classmethod
     def _select_location(
@@ -730,16 +655,35 @@ class BingRssSearchClient:
         return json.loads(json.dumps(payload, ensure_ascii=False))
 
 
+class PublicSearchClient:
+    """Choose dated news or general web results without changing the tool API."""
+
+    def __init__(self, *, web: Any = None, news: Any = None) -> None:
+        self.web = web if web is not None else BingRssSearchClient()
+        self.news = news if news is not None else NewsFeedClient()
+
+    def search(self, query_value: Any) -> Dict[str, Any]:
+        query = BingRssSearchClient._clean_query(query_value)
+        request = ToolRouter.news_request(query)
+        if request is not None:
+            try:
+                return self.news.search(query, **request)
+            except NewsFeedError as exc:
+                # An undated web result is not a fallback for today's news.
+                raise ToolNetworkError(str(exc)) from exc
+        return self.web.search(query)
+
+
 class ToolRouter:
     """Validate and execute a small, fixed registry of assistant tools."""
 
     def __init__(
         self,
         weather_client: Optional[WeatherClient] = None,
-        search_client: Optional[BingRssSearchClient] = None,
+        search_client: Any = None,
     ) -> None:
         self.weather = weather_client or WeatherClient()
-        self.search = search_client or BingRssSearchClient()
+        self.search = search_client if search_client is not None else PublicSearchClient()
         self.station_by_id = {station["id"]: dict(station) for station in RADIO_STATIONS}
 
     def definitions(self) -> List[Dict[str, Any]]:
@@ -875,6 +819,10 @@ class ToolRouter:
                 if labels
                 else "我找到了相关网页摘要，但暂时无法整理，请稍后再试。"
             )
+            if payload.get("coverage_note") and labels:
+                spoken = "以下是%s发布的新闻：%s。%s" % (
+                    payload.get("source", "新闻源"), "；".join(labels), payload["coverage_note"]
+                )
             return ToolExecution(name, payload, spoken)
         if name == "play_radio":
             self._require_keys(args, {"station_id"}, required={"station_id"})
@@ -1140,6 +1088,7 @@ class ToolRouter:
             not text
             or cls.has_negated_action(text)
             or cls._has_meta_action_context(text)
+            or cls._has_unsafe_search_continuation(text)
             or cls._contains_sensitive_personal_data(text)
             or bool(cls._search_query(text, explicit_only=True))
         ):
@@ -1160,13 +1109,15 @@ class ToolRouter:
             stripped_working = cls._strip_weather_request_prefix(working)
             chinese_match = re.fullmatch(
                 r"(?P<body>.*?)天气\s*"
-                r"(?:怎么样|怎样|如何|情况(?:怎么样)?|好吗|呢)?",
+                r"(?:今天|现在|当前)?\s*"
+                r"(?:怎么样|怎样|如何|情况(?:怎么样)?|好吗|好不好|呢)?"
+                r"(?:呀|啊|呢|吗|吧)?",
                 stripped_working,
             )
             if not chinese_match:
                 return None
             city = cls._strip_weather_time_words(chinese_match.group("body"))
-            if city in {"当地", "这里", "这边", "那边"}:
+            if city in {"当地", "这里", "这边", "那边", "本地"}:
                 city = ""
             multiple = cls._has_multiple_places(city)
             if not multiple and not cls._valid_weather_city(city):
@@ -1176,7 +1127,8 @@ class ToolRouter:
         english_working = lowered.strip(" \t\r\n,.?!:;")
         english_match = re.fullmatch(
             r"(?:(?:please\s+)?(?:what(?:'s|\s+is)\s+|check\s+|show\s+|"
-            r"tell\s+me\s+)?(?:the\s+)?)weather\s+(?:in|for)\s+(.+)",
+            r"tell\s+me\s+)?(?:the\s+)?)"
+            r"(?:current\s+)?weather\s+(?:like\s+)?(?:in|for)\s+(.+)",
             english_working,
             re.IGNORECASE,
         )
@@ -1224,12 +1176,15 @@ class ToolRouter:
         cls,
         value: str,
     ) -> bool:
-        city = value.strip()
+        # Request grammar has already separated the location from the command.
+        # Validate the shape of that location, not membership in a hand-picked
+        # city list. The fixed geocoder decides whether the place exists.
+        city = canonicalize_privacy_text(value)
         if not city:
             return True
         if len(city) < 2 or len(city) > 80:
             return False
-        if cls._contains_sensitive_personal_data(city):
+        if cls._contains_sensitive_personal_data(city) or is_sensitive_memory_text(city):
             return False
         if not re.fullmatch(
             r"[\u3400-\u9fffA-Za-zÀ-ÖØ-öø-ÿ .,'’·，、/-]+", city
@@ -1240,18 +1195,24 @@ class ToolRouter:
             r"为什么|是否|会不会|你会|这个词|这句话|这几个字|我的|"
             r"别人说|有人说|请|查询|搜索|联网|上网|查找|搜一下|住在|"
             r"患有|诊断|工资|收入|怀孕|癌症|顺便|然后|另外|同时|附近|"
-            r"(?:我|你|他|她|它|本人|自己)(?:在|有|想|要|说|听|看|得|患|的|家))",
+            r"我|你|他|她|本人|自己|家(?:在|住|位于)|住|叫|的|患|得了|"
+            r"得[^，,。；;！？!?]{1,16}(?:病|症|癌)|"
+            r"男朋友|女朋友|同事|老师|先生|女士|儿子|女儿|"
+            r"\b(?:i|me|my|mine|we|our|you|your|he|she|his|her|their|"
+            r"have|has|had|am|is|are|was|were|live|lives|living|"
+            r"home|name|please|check|show|tell|weather|search|then)\b)",
             city,
             re.IGNORECASE,
         ):
             return False
-        if city.casefold() in COMMON_ENGLISH_WEATHER_PLACES:
+        if re.fullmatch(r"[\u3400-\u9fff·]{2,30}", city):
             return True
-        if city in COMMON_BARE_WEATHER_PLACES:
-            return True
-        if city.endswith("市") and city[:-1] in COMMON_BARE_WEATHER_PLACES:
-            return True
-        return False
+        # Latin names may have apostrophes, hyphens and a comma qualifier, e.g.
+        # St. John's or Cambridge, UK; whole sentences are not city names.
+        return bool(re.fullmatch(
+            r"[a-zà-öø-ÿ][a-zà-öø-ÿ.'’-]*(?:[ ,]+[a-zà-öø-ÿ][a-zà-öø-ÿ.'’-]*){0,7}",
+            city,
+        ))
 
     @staticmethod
     def _has_multiple_places(value: str) -> bool:
@@ -1266,7 +1227,8 @@ class ToolRouter:
     def _strip_weather_request_prefix(value: str) -> str:
         text = value.strip()
         pattern = re.compile(
-            r"^(?:请问|麻烦(?:你)?|请(?:你)?|你能不能|能不能|能帮我|能帮忙|"
+            r"^(?:请问|麻烦(?:你)?|请(?:你)?|你能不能|能不能|你能帮我|"
+            r"你可以帮我|能帮我|能帮忙|"
             r"可以(?:请)?|"
             r"帮我|帮忙|给我|替我|我想知道|我想查|想知道|"
             r"查查|查(?:询)?(?:一下|下)?|看(?:看|一下)?|告诉我)\s*"
@@ -1326,44 +1288,12 @@ class ToolRouter:
         query = cls._search_query(text_value, explicit_only=False)
         return query[:MAX_SEARCH_QUERY_CHARS].rstrip()
 
-    @staticmethod
-    def _is_implicit_search_request(text_value: Any) -> bool:
-        text = " ".join(str(text_value or "").strip().split()).strip(
-            " ，,。！？?!：:"
-        )
-        lowered = text.casefold()
-        if re.match(
-            r"^(?:请(?:你)?|麻烦(?:你)?|帮我|给我|替我)?\s*"
-            r"(?:告诉我|介绍一下|看看|查查|查一下|查询一下|我想知道|想知道)",
-            text,
-        ):
-            return True
-        if re.match(
-            r"^(?:今天|今日|最近|近期|现在|当前|刚刚|最新|实时)"
-            r"[^。！？!?]{0,160}(?:有什么|有哪些|发生了什么|是什么|怎么样|"
-            r"如何|多少|谁|何时|哪(?:些|个|条|一))",
-            text,
-        ):
-            return True
-        if re.match(
-            r"^(?:what|which|who|when|how|today|latest|recent|breaking)\b",
-            lowered,
-        ):
-            return True
-        return False
-
     @classmethod
     def _implicit_search_query(cls, text_value: Any) -> str:
         """Extract one request clause instead of exporting the whole turn."""
 
         text = " ".join(str(text_value or "").strip().split()).strip(
-            " ，,。！？?!：:；;"
-        )
-        freshness = re.compile(
-            r"(?:最新|实时|刚刚|今日新闻|今天.*(?:新闻|消息)|"
-            r"近期.*(?:变化|消息)|最近.*(?:新闻|消息|变化)|"
-            r"\b(?:latest|breaking|today'?s?\s+news|recent\s+news)\b)",
-            re.IGNORECASE,
+            " ，,。！？?!：:；;."
         )
         # Prefer the smallest standalone clause that still expresses the
         # request.  This prevents unrelated health, finance, address, or other
@@ -1378,15 +1308,18 @@ class ToolRouter:
         # later cancellation or unrelated clause always wins.
         candidates = clauses[-1:]
         for candidate in candidates:
-            if not freshness.search(candidate):
-                continue
-            if not cls._is_implicit_search_request(candidate):
-                continue
             query = re.sub(
                 r"^(?:请(?:你)?|麻烦(?:你)?|帮我|给我|替我)?\s*"
-                r"(?:告诉我|介绍一下)\s*",
+                r"(?:告诉我|介绍一下|讲讲|说说|看看|聊聊|"
+                r"播报(?:一下)?|播一下|念一下|读一下|"
+                r"我想知道|想知道)\s*",
                 "",
                 candidate,
+            ).strip()
+            query = re.sub(
+                r"^(?:please\s+)?(?:tell\s+me|give\s+me|show\s+me|"
+                r"read(?:\s+me)?)\s+(?:the\s+)?", "", query,
+                flags=re.IGNORECASE,
             ).strip()
             if (
                 len(query) < 2
@@ -1423,49 +1356,102 @@ class ToolRouter:
             or cls._has_unsafe_search_continuation(query)
         )
 
-    @staticmethod
-    def _valid_implicit_search_query(text_value: Any) -> bool:
+    @classmethod
+    def _valid_implicit_search_query(cls, text_value: Any) -> bool:
         query = " ".join(str(text_value or "").strip().split()).strip(
             " ，,。！？?!：:；;"
         )
         if len(query) < 2 or len(query) > 160:
             return False
-        news_match = re.fullmatch(
-            r"(?:今天|今日|最近|近期|现在|当前|刚刚)?\s*"
-            r"(?:有)?(?:什么|哪些)\s*(?:最新|实时|近期|最近)?\s*"
-            r"(?P<topic>[\u3400-\u9fffA-Za-z ]{0,20}?)\s*"
-            r"(?:新闻|消息|动态|进展)(?:吗|呢)?",
-            query,
-            re.IGNORECASE,
-        )
-        if news_match:
-            topic = " ".join(news_match.group("topic").split()).casefold()
-            return topic in SAFE_IMPLICIT_NEWS_TOPICS
-
+        if cls.news_request(query) is not None:
+            return True
         data_match = re.fullmatch(
             r"(?:今天|今日|最近|近期|现在|当前|刚刚|最新|实时)\s*"
             r"(?P<topic>[\u3400-\u9fffA-Za-z ]{1,20}?)\s*"
             r"(?:价格|金价|汇率|比分|结果|数据)"
             r"(?:是多少|有多少|怎么样|如何|吗|呢)",
-            query,
-            re.IGNORECASE,
+            query, re.IGNORECASE,
         )
-        if data_match:
-            topic = " ".join(data_match.group("topic").split()).casefold()
-            return topic in SAFE_IMPLICIT_DATA_TOPICS
+        return bool(data_match and data_match.group("topic").strip().casefold() in SAFE_IMPLICIT_DATA_TOPICS)
 
-        english_news = re.fullmatch(
-            r"(?:(?:what|which)\s+(?:is|are)\s+(?:the\s+)?)?"
-            r"(?:latest|recent|breaking|today'?s?)\s*"
-            r"(?P<topic>[a-z ]{0,30}?)\s*"
-            r"(?:news|updates?|developments?)(?:\s+(?:today|now))?",
-            query,
-            re.IGNORECASE,
+    @classmethod
+    def news_request(cls, text_value: Any) -> Optional[Dict[str, str]]:
+        """Extract public topic and time range for a dated news source."""
+
+        query = " ".join(str(text_value or "").strip().split()).strip(" ，,。！？?!：:；;.")
+        if not 2 <= len(query) <= MAX_SEARCH_QUERY_CHARS:
+            return None
+        period = "today" if re.search(r"今天|今日|\btoday", query, re.IGNORECASE) else "recent"
+        # One grammar validates both recency and the request, so a phrase
+        # cannot pass one layer ("发生了什么") only to fail a second one.
+        recency = r"(?:今天|今日|最近|近期|现在|当前|刚刚|最新|实时)"
+        news = r"(?:新闻|消息|动态|进展|大事|头条|要闻|热点)"
+        topic = r"(?P<topic>[\u3400-\u9fffA-Za-z0-9 .'-]{0,40}?)"
+        qualifier = r"(?:(?:最新|实时|近期|最近|值得关注的|重要的?|重大的?)\s*){0,2}"
+        question = r"(?:都)?(?:有|发生(?:了)?|出了?)?(?:什么|哪些)"
+        suffix = r"(?:吗|呢|呀|啊)?"
+        chinese_patterns = (
+            recency + r"\s*" + question + r"\s*" + qualifier + topic + news + suffix,
+            recency + r"\s*" + topic + question + r"\s*" + qualifier + news + suffix,
+            recency + r"(?:的)?\s*" + qualifier + topic + news + suffix,
+            topic + r"\s*" + recency + r"(?:的)?\s*" + news + suffix,
         )
-        if not english_news:
-            return False
-        topic = " ".join(english_news.group("topic").split()).casefold()
-        return topic in SAFE_IMPLICIT_NEWS_TOPICS
+        for pattern in chinese_patterns:
+            matched = re.fullmatch(pattern, query, re.IGNORECASE)
+            if matched and cls._valid_news_topic(matched.group("topic")):
+                return {
+                    "topic": canonicalize_privacy_text(matched.group("topic")).strip().removesuffix("的").strip(),
+                    "period": period,
+                }
+
+        english_patterns = (
+            r"(?:(?:what|which)\s+(?:is|are)\s+(?:the\s+)?)?"
+            r"(?:latest|recent|breaking|today['’]?s?)\s*"
+            + topic + r"\s*(?:news|headlines?|updates?|developments?)"
+            r"(?:\s+(?:today|now))?",
+            r"what\s+(?:happened|is\s+happening)\s+(?:in\s+(?:the\s+)?)?"
+            + topic + r"\s*(?:news|world)\s+(?:today|recently)",
+        )
+        for pattern in english_patterns:
+            matched = re.fullmatch(pattern, query, re.IGNORECASE)
+            if matched and cls._valid_news_topic(matched.group("topic")):
+                return {"topic": canonicalize_privacy_text(matched.group("topic")), "period": period}
+        return None
+
+    @classmethod
+    def _valid_news_topic(cls, value: str) -> bool:
+        topic = canonicalize_privacy_text(value).strip().removesuffix("的")
+        if not topic:
+            return True
+        # Topics may be new companies, fields or places, not only a fixed
+        # vocabulary. Do not treat personal facts or extra clauses as topics.
+        return (
+            len(topic) >= 2
+            and cls._valid_explicit_search_query(topic)
+            and not re.search(
+                r"(?:我|你|他|她|本人|自己|家(?:在|住|位于)|住|"
+                r"患有|患上|得了|确诊为|诊断为|"
+                r"(?:性取向|信仰|政治面貌|收入|工资|年薪)(?:是|为)|"
+                r"顺便|然后|另外|同时|发生|告诉|说|记住|保存|"
+                r"\b(?:my|our|your|his|her|their|have|has|is|are|was|were|"
+                r"live|lives|then|remember|save)\b)", topic,
+                re.IGNORECASE,
+            )
+        )
+
+    @classmethod
+    def intent_recovery_message(cls, tool_name: str, text: str) -> str:
+        """A parsing miss is uncertainty, not evidence of absent permission."""
+
+        if cls.has_negated_action(text) or cls._has_unsafe_search_continuation(text):
+            return "好的，本次查询没有执行。"
+        if cls._has_meta_action_context(text):
+            return "这句话是在讨论或引用一个操作，我没有执行查询。"
+        if tool_name == "get_weather":
+            return "我还没识别出要查询的城市或地区。你想查哪里的天气？"
+        if tool_name == "web_search":
+            return "我还没识别出要查询的主题。你想了解哪方面的信息？"
+        return "当前指令没有明确授权这个音乐操作，操作没有执行。"
 
     @staticmethod
     def _has_unsafe_search_continuation(text_value: Any) -> bool:
@@ -1639,7 +1625,8 @@ class ToolRouter:
         ):
             return True
         if re.search(
-            r"^(?:怎么|如何|为什么|为何|你会|你能|你可以|系统会|音箱会)"
+            r"^(?:怎么|如何|为什么|为何|你会|你能(?!帮我)|"
+            r"你可以(?!帮我)|系统会|音箱会)"
             r"[^。！？!?]{0,48}" + action,
             lowered,
             re.IGNORECASE,

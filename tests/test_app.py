@@ -552,7 +552,8 @@ class CoreTests(unittest.TestCase):
             arguments={"query": "模型擅自添加的查询"},
         )
         turn = client.respond_with_tools("这是我的私人备忘，不要对外发送", [], router)
-        self.assertIn("没有发送", turn.text)
+        self.assertIn("还没识别", turn.text)
+        self.assertNotIn("没有明确要求", turn.text)
         self.assertEqual(turn.tools_used, ["web_search:guard"])
         self.assertEqual(search.queries, [])
         self.assertEqual(len(client.calls), 1)
@@ -578,7 +579,8 @@ class CoreTests(unittest.TestCase):
             router,
         )
 
-        self.assertIn("没有发送", turn.text)
+        self.assertIn("还没识别", turn.text)
+        self.assertNotIn("没有明确要求", turn.text)
         self.assertEqual(turn.tools_used, ["get_weather:guard"])
         self.assertEqual(weather.cities, [])
         self.assertEqual(len(client.calls), 1)
@@ -1019,7 +1021,7 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(search.queries[-1], "今天有什么最新科技新闻")
         self.assertIn("web_search", implicit["tools_used"][0])
-        self.assertIn("最新、实时或近期新闻", pipeline.health()["privacy_notice"])
+        self.assertIn("新闻查询读取中新网公开 RSS", pipeline.health()["privacy_notice"])
 
     def test_selected_memory_is_bounded_inside_system_message(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1289,7 +1291,7 @@ class LocalHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["app"], "smart-speaker-demo")
         self.assertEqual(
-            payload["build_id"], "agent-foundation-v1"
+            payload["build_id"], app.BUILD_ID
         )
         self.assertEqual(payload["mode"], "mock")
         self.assertEqual(payload["provider_id"], "mock")

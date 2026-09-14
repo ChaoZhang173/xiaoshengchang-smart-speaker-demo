@@ -11,6 +11,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tool_router import (  # noqa: E402
     BingRssSearchClient,
+    PublicSearchClient,
     MAX_TOOL_RESPONSE_BYTES,
     ToolInputError,
     ToolNetworkError,
@@ -153,12 +154,69 @@ class ToolRouterTests(unittest.TestCase):
         self.assertIn("27.5", result.spoken_fallback)
         self.assertEqual(result.client_actions, [])
 
+    def test_unindexed_chinese_place_retries_pinyin_and_keeps_chinese_label(self):
+        client = WeatherClient()
+        opener = RecordingWeatherOpener([
+            FakeHTTPResponse({"results": []}),
+            FakeHTTPResponse({"results": [
+                {"name": "Gaomin", "country_code": "CN", "latitude": 26.0,
+                 "longitude": 99.0, "population": 999999},
+                {"name": "Gaomi", "country_code": "US", "latitude": 36.0,
+                 "longitude": -80.0, "population": 999999},
+                {"name": "Gaomi", "country_code": "CN", "latitude": 36.38,
+                 "longitude": 119.75, "admin1": "山东", "country": "中国"},
+            ]}),
+            FakeHTTPResponse({"current": {
+                "temperature_2m": 24.6, "apparent_temperature": 25.0,
+                "relative_humidity_2m": 62, "wind_speed_10m": 6.0,
+                "weather_code": 1, "precipitation": 0,
+            }}),
+        ])
+        client._opener = opener
+        with patch.object(WeatherClient, "_romanized_place_name", return_value="gaomi"):
+            payload = client.current("高密")
+        self.assertEqual(payload["location"], "高密，山东，中国")
+        self.assertEqual(payload["temperature_c"], 24.6)
+        self.assertIn("name=gaomi", opener.calls[1][0].full_url)
+        self.assertIn("latitude=36.38000", opener.calls[2][0].full_url)
+        self.assertIn("longitude=119.75000", opener.calls[2][0].full_url)
+
+    def test_pinyin_conversion_is_local_bounded_and_not_executable_input(self):
+        with patch("tool_router.sys.platform", "darwin"), patch("tool_router.subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = "gao mi\n"
+            self.assertEqual(WeatherClient._romanized_place_name("高密"), "gaomi")
+            self.assertEqual(run.call_args.args[0][-1], "高密")
+            self.assertEqual(run.call_args.kwargs["timeout"], 2)
+            self.assertNotIn("shell", run.call_args.kwargs)
+            self.assertEqual(WeatherClient._romanized_place_name("高密;open bad"), "")
+            self.assertEqual(run.call_count, 1)
+
     def test_search_uses_structured_result(self):
         result = self.router.execute("web_search", '{"query":"OpenAI 最新消息"}')
         self.assertEqual(self.search.queries, ["OpenAI 最新消息"])
         self.assertEqual(result.payload["source"], "Bing RSS（实验性）")
         self.assertIn("example.com", result.spoken_fallback)
         self.assertEqual(result.client_actions, [])
+
+    def test_dated_news_does_not_use_ordinary_undated_web_results(self):
+        web = FakeSearch()
+        with patch("tool_router.NewsFeedClient") as news_type:
+            news = news_type.return_value
+            news.search.return_value = {"source": "中新网", "results": []}
+            client = PublicSearchClient(web=web, news=news)
+            client.search("今天发生了什么新闻")
+            news.search.assert_called_once_with(
+                "今天发生了什么新闻", topic="", period="today"
+            )
+            self.assertEqual(web.queries, [])
+            from news_feed import NewsFeedError
+            news.search.side_effect = NewsFeedError("当前来源没有符合时间范围的新闻。")
+            with self.assertRaises(ToolNetworkError):
+                client.search("今天的新闻")
+            self.assertEqual(web.queries, [])
+            client.search("Python 官方文档")
+            self.assertEqual(web.queries, ["Python 官方文档"])
 
     def test_radio_action_contains_id_not_model_visible_url(self):
         station = public_radio_stations()[0]
@@ -278,6 +336,8 @@ class ToolRouterTests(unittest.TestCase):
             "张三家在海淀区天气怎么样",
             "王老师住浦东新区天气怎么样",
             "张三的性取向是同性恋海淀区天气怎么样",
+            "查询张三得了帕金森病县的天气",
+            "查询张三患阿尔茨海默病市天气",
             "what is the weather in London I have cancer",
             "请莫查上海天气",
             "please do not get London weather",
@@ -376,6 +436,8 @@ class ToolRouterTests(unittest.TestCase):
             "what are the latest news my religion is Buddhist news",
             "今天有什么最新科技新闻，不用了",
             "今天有什么最新科技新闻，我改变主意了",
+            "今天张三患有帕金森病有什么新闻",
+            "今天张三的性取向是同性恋有什么新闻",
         )
         for text in non_commands:
             with self.subTest(text=text):

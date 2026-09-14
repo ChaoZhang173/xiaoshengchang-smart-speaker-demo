@@ -302,17 +302,7 @@ class GovernedToolRouter(ToolRouter):
 
         authorized = self._router.authorized_intent(text)
         if authorized is None or authorized.get("tool_name") != name:
-            if name == "get_weather":
-                return {}, (
-                    "这条指令没有明确要求通过天气服务查询当前天气，我没有发送任何地点信息。"
-                    "需要查询时，请说“查询上海现在的天气”。"
-                )
-            if name == "web_search":
-                return {}, (
-                    "这条指令没有明确要求联网搜索，我没有发送任何搜索内容。"
-                    "需要联网时，请说“联网搜索……”。"
-                )
-            return {}, "当前指令没有明确授权这个音乐操作，操作没有执行。"
+            return {}, self._router.intent_recovery_message(name, text)
 
         if name == "get_weather":
             guard = self._router.weather_guard(text)
@@ -326,10 +316,7 @@ class GovernedToolRouter(ToolRouter):
         if name == "web_search":
             query = str(authorized["arguments"].get("query", "")).strip()
             if not query:
-                return {}, (
-                    "这条指令没有明确要求联网搜索，我没有发送任何搜索内容。"
-                    "需要联网时，请说“联网搜索……”。"
-                )
+                return {}, self._router.intent_recovery_message(name, text)
             return {"query": query}, None
 
         return dict(authorized["arguments"]), None
